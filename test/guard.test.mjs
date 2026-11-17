@@ -194,3 +194,12 @@ test("JSON-string typed data to a high-risk spender is blocked like the object f
   const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } }) });
   assert.equal((await g.beforeToolCall({ toolName: "wallet_request", params: { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] } })).block, true);
 });
+
+test("raw EIP-2612 permit calldata to a high-risk spender is blocked; a hex chain id is screened on that chain", async () => {
+  const pd = "0xd505accf" + SP.slice(2).padStart(64, "0") + BADSP.slice(2).padStart(64, "0") + "a".padStart(64, "0") + "f".repeat(64) + "1b".padStart(64, "0") + "ab".repeat(32) + "cd".repeat(32);
+  const seen = []; const f = riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } });
+  const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async (u) => { seen.push(u); return f(u); } });
+  assert.equal((await g.beforeToolCall({ toolName: "send_transaction", params: { data: pd, chainId: "0x1" } })).block, true);
+  assert.match(seen[0], /chain=ethereum/);
+  const d = await g.beforeToolCall({ toolName: "send_transaction", params: { data: pd, chainId: "0x1234567" } }); assert.ok(d.requireApproval); assert.match(d.requireApproval.description, /unsupported chain/);
+});

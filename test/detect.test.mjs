@@ -46,8 +46,8 @@ test("batch: every approval is returned, in both orders, nested and mixed struct
   for (const batch of [[{ data: approveData(SP, 5n) }, { data: approveData(BAD, 5n) }], [{ data: approveData(BAD, 5n) }, { data: approveData(SP, 5n) }]]) {
     const r = detectApprovals("send_calls", { calls: batch, chainId: 8453 }); assert.deepEqual(r.approvals.map((a) => a.spender).sort(), [BAD, SP].sort()); assert.deepEqual(r.problems, []);
   }
-  const nested = detectApprovals("wallet_sendCalls", { request: { params: [{ chainId: "0x1", calls: [{ functionName: "approve", args: [BAD, "1"], chainId: 1 }, { inner: { transactions: [{ data: approveData(SP, 1n), chainId: 42161 }] } }] }] } });
-  assert.equal(nested.approvals.length, 2); assert.equal(nested.approvals.find((a) => a.spender === SP).chain, "arbitrum"); assert.equal(nested.approvals.find((a) => a.spender === BAD).chain, "ethereum");
+  const nested = detectApprovals("wallet_sendCalls", { request: { params: [{ chainId: "0x1", calls: [{ functionName: "approve", args: [BAD, "1"], chainId: 1 }, { inner: { transactions: [{ data: approveData(SP, 1n), chainId: "eip155:1" }] } }] }] } });
+  assert.equal(nested.approvals.length, 2); assert.deepEqual(nested.problems, []); assert.ok(nested.approvals.every((a) => a.chain === "ethereum"));
 });
 test("Permit2 approve: spender is args[1], amount args[2], expiration args[3] (structured and calldata)", () => {
   const s = detectApprovals("wallet_call", { functionName: "approve(address,address,uint160,uint48)", args: [TOKEN, BAD, "1461501637330902918203684832716283019655932542975", "1800000000"] }).approvals[0];
@@ -106,4 +106,35 @@ test("typed data: malformed, oversized or unreadable signing payloads are report
   assert.match(detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, "not json"] }).problems.join(), /without readable typed data/);
   assert.match(detectApprovals("sign_typed_data", { typedData: JSON.stringify(permitTD("PermitSingle", { details: {} })) }).problems.join(), /spender/);
   assert.deepEqual(detectApprovals("chat", { text: "[1, 2, 3]" }), { approvals: [], problems: [] }, "unrelated JSON is ignored");
+});
+
+// --- 0.1.4 rescan: chain identifiers and raw permit calldata ---
+test("chain ids: 0x1, 1, \"1\", ethereum and eip155:1 give the same screening chain; unsupported and conflicting ids are reported", () => {
+  for (const id of ["0x1", 1, "1", "ethereum", "eip155:1", "EIP155:0x1"]) { const r = detectApprovals("send_transaction", { data: approveData(SP, 5n), chainId: id }); assert.equal(r.approvals[0].chain, "ethereum", String(id)); assert.deepEqual(r.problems, []); }
+  assert.equal(detectApprovals("send_transaction", { tx: { data: approveData(SP, 5n) }, options: { chainId: "0x2105" } }).approvals[0].chain, "base");
+  const un = detectApprovals("send_transaction", { data: approveData(SP, 5n), chainId: "0x1234567" }); assert.equal(un.approvals.length, 0); assert.match(un.problems[0], /unsupported chain/);
+  const cf = detectApprovals("send_transaction", { data: approveData(SP, 5n), chainId: 1, network: "base" }); assert.equal(cf.approvals.length, 0); assert.match(cf.problems[0], /conflicting/);
+  const nest = detectApprovals("wallet_sendCalls", { chainId: "0x1", calls: [{ data: approveData(SP, 5n), chainId: 8453 }] }); assert.equal(nest.approvals.length, 0); assert.match(nest.problems[0], /conflicting/);
+  assert.equal(detectApprovals("sign_typed_data", { typedData: { primaryType: "Permit", domain: { chainId: "0xa4b1" }, message: { spender: SP } } }).approvals[0].chain, "arbitrum");
+  assert.match(detectApprovals("sign_typed_data", { typedData: { primaryType: "Permit", domain: { chainId: 999999 }, message: { spender: SP } } }).problems[0], /unsupported chain/);
+  assert.equal(detectApprovals("send_transaction", { data: approveData(SP, 5n) }).approvals[0].chain, "base", "absent -> default");
+});
+const w = (x) => pad(typeof x === "bigint" ? x.toString(16) : x);
+const permitData = (owner, spender, value) => "0xd505accf" + w(owner) + w(spender) + w(value) + w(9999999999n) + w(27n) + "ab".repeat(32) + "cd".repeat(32);
+const daiPermit = (spender, allowed) => "0x8fcbaf0c" + w(SP) + w(spender) + w(0n) + w(0n) + w(allowed ? 1n : 0n) + w(27n) + "ab".repeat(32) + "cd".repeat(32);
+const p2Single = (spender) => "0x2b67b570" + w(SP) + w(TOKEN) + w((1n << 160n) - 1n) + w(1800000000n) + w(0n) + w(spender) + w(1800000000n) + w(0x100n) + w(65n) + "ab".repeat(65) + "00".repeat(31);
+const p2Batch = (spender) => "0x2a2d80d1" + w(SP) + w(0x60n) + w(0x140n) + w(0x60n) + w(spender) + w(1800000000n) + w(1n) + w(TOKEN) + w(5n) + w(1800000000n) + w(0n) + w(65n) + "ab".repeat(65) + "00".repeat(31);
+test("raw permit calldata: EIP-2612, DAI permit, Permit2 permit (single and batch) are decoded like their structured forms", () => {
+  const e = detectApprovals("send_transaction", { data: permitData(SP, BAD, 10n) }).approvals[0]; assert.equal(e.fn, "permit"); assert.equal(e.spender, BAD); assert.equal(e.amount, "10");
+  assert.equal(detectApprovals("wallet_call", { functionName: "permit", args: [SP, BAD, "10", "9999999999", 27, "0x" + "ab".repeat(32), "0x" + "cd".repeat(32)] }).approvals[0].spender, BAD);
+  assert.equal(detectApprovals("send_transaction", { data: daiPermit(BAD, true) }).approvals[0].spender, BAD);
+  assert.equal(detectApprovals("send_transaction", { data: daiPermit(BAD, false) }).approvals.length, 0);
+  assert.equal(detectApprovals("wallet_call", { functionName: "permit", args: [SP, BAD, 0, 0, true, 27, "0x", "0x"] }).approvals[0].fn, "permit.dai");
+  const s1 = detectApprovals("send_transaction", { data: p2Single(BAD) }).approvals[0]; assert.equal(s1.fn, "permit2.permit"); assert.equal(s1.spender, BAD); assert.equal(s1.unlimited, true);
+  assert.equal(detectApprovals("wallet_call", { functionName: "permit", args: [SP, { details: { token: TOKEN, amount: "5" }, spender: BAD, sigDeadline: "1" }, "0x"] }).approvals[0].spender, BAD);
+  const b1 = detectApprovals("send_transaction", { data: p2Batch(BAD) }).approvals[0]; assert.equal(b1.fn, "permit2.permitBatch"); assert.equal(b1.spender, BAD);
+  // nested in a batch, and truncated/malformed
+  assert.equal(detectApprovals("wallet_sendCalls", { calls: [{ data: approveData(SP, 1n) }, { data: permitData(SP, BAD, 1n) }] }).approvals.length, 2);
+  assert.match(detectApprovals("send_transaction", { data: permitData(SP, BAD, 1n).slice(0, 10 + 64 * 2) }).problems[0], /could not be decoded/);
+  assert.match(detectApprovals("send_transaction", { data: "0x2a2d80d1" + w(SP) + w(0x7fffn) }).problems[0], /could not be decoded/);
 });

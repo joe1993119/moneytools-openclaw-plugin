@@ -12,7 +12,16 @@ const SELECTORS = {
   "0x39509351": { fn: "increaseAllowance", spenderArg: 0, amountArg: 1 },
   "0xa22cb465": { fn: "setApprovalForAll", spenderArg: 0, boolArg: 1 },
   "0x87517c45": { fn: "permit2.approve", spenderArg: 1, amountArg: 2 },
+  // EIP-2612 permit(owner, spender, value, deadline, v, r, s)
+  "0xd505accf": { fn: "permit", spenderArg: 1, amountArg: 2 },
+  // DAI-style permit(holder, spender, nonce, expiry, allowed, v, r, s)
+  "0x8fcbaf0c": { fn: "permit.dai", spenderArg: 1, boolArg: 4 },
+  // Permit2 permit(owner, PermitSingle{details{token, amount, expiration, nonce}, spender, sigDeadline}, signature): static tuple inline
+  "0x2b67b570": { fn: "permit2.permit", spenderArg: 5, amountArg: 2 },
+  // Permit2 permit(owner, PermitBatch{details[], spender, sigDeadline}, signature): dynamic tuple, spender = 2nd word of the tuple
+  "0x2a2d80d1": { fn: "permit2.permitBatch", spenderArg: (hex) => { const o = word(hex, 1); if (!o) return null; const off = BigInt("0x" + o); return off % 32n === 0n && off < 1n << 20n ? Number(off / 32n) + 1 : null; }, noAmount: true },
 };
+const spenderIdx = (hex, sel) => (typeof sel.spenderArg === "function" ? sel.spenderArg(hex) : sel.spenderArg);
 const APPROVE_FN = /^(approve|increaseallowance|setapprovalforall|permit|permit2[._]?approve)$/i;
 const PERMIT_TYPES = /^(permit|permitsingle|permitbatch|permittransferfrom|permitbatchtransferfrom)$/i;
 const MAX_UINT256 = (1n << 256n) - 1n;
@@ -20,7 +29,9 @@ const ADDR = /^0x[0-9a-fA-F]{40}$/;
 
 export const CHAINS = { base: "base", "8453": "base", "eip155:8453": "base", ethereum: "ethereum", mainnet: "ethereum", eth: "ethereum", "1": "ethereum", "eip155:1": "ethereum",
   arbitrum: "arbitrum", "arbitrum-one": "arbitrum", "42161": "arbitrum", "eip155:42161": "arbitrum", optimism: "optimism", op: "optimism", "10": "optimism", "eip155:10": "optimism",
-  polygon: "polygon", matic: "polygon", "137": "polygon", "eip155:137": "polygon", bsc: "bsc", bnb: "bsc", "56": "bsc", "eip155:56": "bsc", avalanche: "avalanche", avax: "avalanche", "43114": "avalanche", "eip155:43114": "avalanche" };
+  polygon: "polygon", matic: "polygon", "137": "polygon", "eip155:137": "polygon", bsc: "bsc", bnb: "bsc", "56": "bsc", "eip155:56": "bsc", avalanche: "avalanche", avax: "avalanche", "43114": "avalanche", "eip155:43114": "avalanche",
+  "base-mainnet": "base", "ethereum-mainnet": "ethereum", "eth-mainnet": "ethereum", homestead: "ethereum", "arbitrum-mainnet": "arbitrum", arb1: "arbitrum", "optimism-mainnet": "optimism", "op-mainnet": "optimism",
+  "polygon-mainnet": "polygon", "matic-mainnet": "polygon", "bsc-mainnet": "bsc", binance: "bsc", "avalanche-c": "avalanche", "avax-c": "avalanche" };
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 function* walk(v, depth = 0, key = "") { if (depth > 6) return; yield [key, v]; if (Array.isArray(v)) { for (const x of v.slice(0, 50)) yield* walk(x, depth + 1, key); } else if (isObj(v)) { for (const [k, x] of Object.entries(v).slice(0, 100)) yield* walk(x, depth + 1, k); } }
@@ -66,27 +77,46 @@ function word(hex, i) { const w = hex.slice(10 + 64 * i, 10 + 64 * (i + 1)); ret
 function decodeCalldata(data) {
   if (typeof data !== "string" || !/^0x[0-9a-fA-F]{8}/.test(data)) return null;
   const sel = SELECTORS[data.slice(0, 10).toLowerCase()]; if (!sel) return null;
-  const sw = word(data, sel.spenderArg); if (!sw) return null;
+  const si = spenderIdx(data, sel); const sw = si === null ? null : word(data, si); if (!sw || !/^0{24}/.test(sw)) return null;
   const spender = "0x" + sw.slice(24);
+  if (BigInt(spender) === 0n) return null; // approval to the zero address grants nothing
   if (sel.boolArg !== undefined) { const b = word(data, sel.boolArg); if (!b || BigInt("0x" + b) === 0n) return null; return { fn: sel.fn, spender, unlimited: true }; }
+  if (sel.noAmount) return { fn: sel.fn, spender, unlimited: false };
   const aw = word(data, sel.amountArg); if (!aw) return null; const amount = BigInt("0x" + aw); // truncated calldata is undecodable
   // approve(addr, uint256) is shared by ERC-20 (amount) and ERC-721 (tokenId): only a zero-address spender is a certain revoke.
   // A non-zero spender with 0 is ambiguous (ERC-20 revoke or ERC-721 token #0) and is still screened.
-  if (BigInt(spender) === 0n) return null;
-  const unlimited = sel.fn === "permit2.approve" ? amount >= (1n << 160n) - 1n : amount >= MAX_UINT256 / 2n;
+  const unlimited = sel.fn.startsWith("permit2.") ? amount >= (1n << 160n) - 1n : amount >= MAX_UINT256 / 2n;
   const out = { fn: sel.fn, spender, amount: amount.toString(), unlimited };
   if (sel.fn === "approve" && amount === 0n) out.ambiguousZero = true;
   return out;
 }
+const CHAIN_KEY = /^(chain|chainid|chain_id|network|chainname)$/i;
+/** One normalizer for every chain identifier: names, decimal / hex ids, numbers, CAIP-2 (eip155:N). -> { chain } | { unsupported } | null (absent) */
+export function normalizeChain(raw) {
+  if (raw === undefined || raw === null || raw === "" || (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "bigint")) return null;
+  let s = String(raw).trim().toLowerCase(); const caip = /^eip155:(.+)$/.exec(s); if (caip) s = caip[1];
+  if (/^0x[0-9a-f]+$/.test(s) || /^\d+$/.test(s)) s = BigInt(s).toString();
+  const c = CHAINS[s]; return c ? { chain: c } : { unsupported: String(raw) };
+}
+/** Chain declared on one object. Several identifiers on the same object must agree. -> chain name | "?unsupported:x" | "?conflict:a/b" | null */
+function chainFrom(v) {
+  if (!isObj(v)) return null; const found = [];
+  for (const k of Object.keys(v)) if (CHAIN_KEY.test(k)) { const n = normalizeChain(v[k]); if (n) found.push(n.chain || `?unsupported:${n.unsupported}`); }
+  const uniq = [...new Set(found)]; if (!uniq.length) return null; if (uniq.length === 1) return uniq[0];
+  return `?conflict:${uniq.join("/")}`;
+}
+/** Chain for the whole call when the approval's own objects do not declare one: the only chain declared anywhere, else the default when none is declared. */
 function chainOf(params, fallback) {
-  for (const [k, v] of walk(params)) if (/^(chain|chainid|chain_id|network|chainname)$/i.test(k) && (typeof v === "string" || typeof v === "number")) { const c = CHAINS[String(v).toLowerCase()]; if (c) return c; }
-  return fallback;
+  const found = new Set();
+  for (const [k, v] of walk(params)) if (CHAIN_KEY.test(k)) { const n = normalizeChain(v); if (n) found.add(n.chain || `?unsupported:${n.unsupported}`); }
+  if (!found.size) return fallback; if (found.size === 1) return [...found][0];
+  return `?conflict:${[...found].join("/")}`;
 }
 
 const PERMIT2_ONE = /^permit2[._]?approve$/i;
 const MAX_OPS = 20, MAX_DEPTH = 12, MAX_ITEMS = 200, MAX_JSON = 200000;
 const SIGN_TYPED = /^(eth_signTypedData(_v[34])?|wallet_signTypedData|signTypedData)$/i;
-const typedChain = (id) => { if (id === undefined || id === null) return null; const s = String(id).toLowerCase(); const dec = /^0x[0-9a-f]+$/.test(s) ? BigInt(s).toString() : s; return CHAINS[dec] || null; };
+const typedChain = (id) => { const n = normalizeChain(id); return n ? n.chain || `?unsupported:${n.unsupported}` : null; };
 /** JSON-RPC / signer adapter: a typed-data signing request must carry a typed-data object (or JSON string) we can read. */
 function signingAdapter(v, problems) {
   const m = v.method ?? v.rpcMethod; if (typeof m !== "string" || !SIGN_TYPED.test(m)) return;
@@ -97,7 +127,6 @@ function signingAdapter(v, problems) {
 const fnName = (fn) => String(fn).replace(/\(.*$/, "").trim();
 const isAddr = (x) => typeof x === "string" && ADDR.test(x);
 const isUnlimited = (amt, bits = 256) => amt === true || /^(max|unlimited|infinite)$/i.test(String(amt)) || (/^\d+$/.test(String(amt)) && BigInt(String(amt)) >= (bits === 160 ? (1n << 160n) - 1n : MAX_UINT256 / 2n));
-const chainFrom = (v) => { if (!isObj(v)) return null; for (const k of Object.keys(v)) if (/^(chain|chainid|chain_id|network|chainname)$/i.test(k) && (typeof v[k] === "string" || typeof v[k] === "number")) { const c = CHAINS[String(v[k]).toLowerCase()]; if (c) return c; } return null; };
 
 /** Approval selectors embedded in batch calldata (multicall, multiSend, execute ...): word-aligned ones are decoded, anything else is reported as undecodable. */
 function embeddedApprovals(hex, ops, problems, chain) {
@@ -132,13 +161,18 @@ function structuredApproval(v, chain, problems) {
   } else if (lname === "setapprovalforall") {
     spender = args.length ? args[0] : v.operator; const on = args.length ? args[1] : v.approved;
     if (on === false || on === "false" || on === 0 || on === "0") return null; unlimited = true;
+  } else if (lname === "permit" && isObj(args[1])) { // Permit2 permit(owner, PermitSingle | PermitBatch, signature)
+    fn = Array.isArray(args[1].details) ? "permit2.permitBatch" : "permit2.permit"; spender = args[1].spender; amount = Array.isArray(args[1].details) ? undefined : args[1].details?.amount; unlimited = isUnlimited(amount, 160);
+  } else if (lname === "permit" && (args.length === 8 || sig === "address,address,uint256,uint256,bool,uint8,bytes32,bytes32")) { // DAI permit(holder, spender, nonce, expiry, allowed, v, r, s)
+    fn = "permit.dai"; spender = args[1]; const on = args[4]; if (on === false || on === "false" || on === 0 || on === "0") return null; unlimited = true;
   } else if (lname === "permit") { // EIP-2612 permit(owner, spender, value, deadline, v, r, s)
     spender = args.length ? args[1] : v.spender; amount = args.length ? args[2] : v.value; unlimited = isUnlimited(amount);
   } else { problems.push(`unsupported approval call ${name}`); return null; }
   // Explicit fields must agree with the arguments that will execute.
   for (const k of ["spender", "operator"]) if (isAddr(v[k]) && isAddr(spender) && v[k].toLowerCase() !== spender.toLowerCase()) { problems.push(`${name}: ${k} field ${v[k]} disagrees with the call arguments (${spender})`); return null; }
   if (!isAddr(spender)) { problems.push(`${name} call without a decodable spender`); return null; }
-  const op = { fn, spender, chain: chainFrom(v) || chain, unlimited: !!unlimited, via: "structured" };
+  if (BigInt(spender) === 0n) return null; // approval to the zero address grants nothing
+  const op = { fn, spender, chain, unlimited: !!unlimited, via: "structured" };
   if (amount !== undefined) op.amount = String(amount); if (expiration !== undefined) op.expiration = String(expiration); if (ambiguousZero) op.ambiguousZero = true;
   return op;
 }
@@ -158,7 +192,7 @@ export function detectApprovals(toolName, params, opts = {}) {
   const name = String(toolName || ""); const approvals = [], problems = [];
   if (/^moneytools_/i.test(name)) return { approvals, problems };
   const ops = [];
-  const visit = (v, chain, depth) => {
+  const visit = (v, chain, depth, explicit = false) => {
     if (depth > MAX_DEPTH) { if (v && typeof v === "object") problems.push("transaction data nested too deeply to screen"); return; }
     if (typeof v === "string") {
       const t = v.trim();
@@ -166,7 +200,7 @@ export function detectApprovals(toolName, params, opts = {}) {
         const looksSigning = /primaryType|permit|spender|"data"\s*:\s*"0x|approve/i.test(t);
         if (t.length > MAX_JSON) { if (looksSigning) problems.push("serialized signing/transaction payload too large to screen"); return; }
         let parsed; try { parsed = JSON.parse(t); } catch { if (looksSigning) problems.push("serialized signing/transaction payload could not be parsed"); return; }
-        visit(parsed, chain, depth + 1); return;
+        visit(parsed, chain, depth + 1, explicit); return;
       }
       if (!/^0x[0-9a-fA-F]{8}/.test(v) || v.length === 42 || v.length === 66) return; // addresses and hashes are not calldata
       const sel = SELECTORS[v.slice(0, 10).toLowerCase()];
@@ -174,34 +208,39 @@ export function detectApprovals(toolName, params, opts = {}) {
       else if (v.length > 10 + 128) embeddedApprovals(v, ops, problems, chain);
       return;
     }
-    if (Array.isArray(v)) { if (v.length > MAX_ITEMS) problems.push("transaction batch too large to screen"); for (const x of v.slice(0, MAX_ITEMS)) visit(x, chain, depth + 1); return; }
+    if (Array.isArray(v)) { if (v.length > MAX_ITEMS) problems.push("transaction batch too large to screen"); for (const x of v.slice(0, MAX_ITEMS)) visit(x, chain, depth + 1, explicit); return; }
     if (!isObj(v)) return;
-    const ch = chainFrom(v) || chain; const keys = Object.keys(v);
+    const own = chainFrom(v);
+    // A nested object may not silently switch away from a chain its parent declared explicitly.
+    const ch = !own ? chain : explicit && chain !== own && !own.startsWith("?") && !chain.startsWith("?") ? `?conflict:${chain}/${own}` : own;
+    const isExplicit = explicit || !!own; const keys = Object.keys(v);
     if (keys.length > MAX_ITEMS) problems.push("transaction object too large to screen");
     const st = structuredApproval(v, ch, problems); if (st) ops.push(st);
     signingAdapter(v, problems);
     ops.push(...typedDataApprovals(v, ch, problems));
     // calldata in the same object must agree with the structured call
     if (st && typeof v.data === "string") { const d = decodeCalldata(v.data); if (d && d.spender.toLowerCase() !== st.spender.toLowerCase()) problems.push(`structured ${st.fn} spender ${st.spender} disagrees with calldata spender ${d.spender}`); }
-    for (const k of keys.slice(0, MAX_ITEMS)) visit(v[k], ch, depth + 1);
+    for (const k of keys.slice(0, MAX_ITEMS)) visit(v[k], ch, depth + 1, isExplicit);
   };
-  visit(params, chainOf(params, opts.defaultChain || "base"), 0);
+  visit(params, chainOf(params, opts.defaultChain || "base"), 0, false);
   if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
     const cmd = commandOf(params); const chain = chainOf(params, opts.defaultChain || "base");
     const re = /\bcast\s+send\b[^\n]*?["']?(approve|increaseAllowance|setApprovalForAll)\s*\([^)]*\)["']?\s+(0x[0-9a-fA-F]{40})/gi; let m, found = 0;
-    while ((m = re.exec(cmd))) { found++; const ch = /--chain(?:-id)?\s+(\S+)/.exec(cmd.slice(m.index))?.[1]; ops.push({ fn: m[1], spender: m[2], chain: (ch && CHAINS[ch.toLowerCase()]) || chain, unlimited: /max|uint256\.max|115792089237316195423570985008687907853269984665640564039457584007913129639935/i.test(cmd), via: "exec:cast" }); }
+    while ((m = re.exec(cmd))) { found++; const ch = normalizeChain(/--chain(?:-id)?\s+(\S+)/.exec(cmd.slice(m.index))?.[1]); ops.push({ fn: m[1], spender: m[2], chain: ch ? ch.chain || `?unsupported:${ch.unsupported}` : chain, unlimited: /max|uint256\.max|115792089237316195423570985008687907853269984665640564039457584007913129639935/i.test(cmd), via: "exec:cast" }); }
     const mentions = (cmd.match(/\b(approve|increaseAllowance|setApprovalForAll|permit)\s*\(/gi) || []).length;
     if (/\b(cast\s+send|cast\s+calldata|seth\s+send)\b/i.test(cmd) && mentions > found) problems.push("command contains an approval call that could not be parsed");
   }
   const seen = new Set();
-  for (const o of ops) { const k = `${o.chain}:${o.spender.toLowerCase()}:${o.fn}`; if (!seen.has(k)) { seen.add(k); approvals.push(o); } }
+  for (const o of ops) {
+    // Never screen on a guessed network: unsupported or conflicting chain identifiers go to onCheckError.
+    if (o.chain.startsWith("?")) { const [kind, val] = o.chain.slice(1).split(/:(.*)/); problems.push(`${o.fn} to ${o.spender}: ${kind === "conflict" ? "conflicting chain identifiers" : "unsupported chain"} ${val}`); continue; } const k = `${o.chain}:${o.spender.toLowerCase()}:${o.fn}`; if (!seen.has(k)) { seen.add(k); approvals.push(o); } }
   if (approvals.length > MAX_OPS) { problems.push(`${approvals.length} approvals in one call; only the first ${MAX_OPS} are screened`); approvals.length = MAX_OPS; }
   return { approvals, problems: [...new Set(problems)] };
 }
 /** Certain revokes only: setApprovalForAll(op, false), or any approval to the zero address. Same rule as decodeCalldata. */
 function isRevoke(hex, sel) {
-  const sw = word(hex, sel.spenderArg); if (sw === null) return false;
-  if (BigInt("0x" + sw) === 0n) return word(hex, sel.amountArg ?? sel.boolArg) !== null;
+  const si = spenderIdx(hex, sel); const sw = si === null ? null : word(hex, si); if (sw === null) return false;
+  if (BigInt("0x" + sw) === 0n) return sel.noAmount || word(hex, sel.amountArg ?? sel.boolArg) !== null;
   if (sel.boolArg !== undefined) { const b = word(hex, sel.boolArg); return b !== null && BigInt("0x" + b) === 0n; }
   return false;
 }

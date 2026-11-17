@@ -56,13 +56,16 @@ The plugin uses OpenClaw's `before_tool_call` hook.
   - any tool call that carries a `PAYMENT-SIGNATURE` or `X-PAYMENT` header;
   - an `exec` command running `agentcash fetch <url>` or sending a payment header.
 - **Approval**:
-  - calldata with the `approve`, `increaseAllowance`, `setApprovalForAll(true)` or Permit2 `approve` selector;
+  - calldata with the `approve`, `increaseAllowance`, `setApprovalForAll(true)`, EIP-2612 `permit`, DAI `permit`, Permit2 `approve`, or Permit2 `permit` (single and batch) selector;
   - structured calls decoded by their ABI: `approve` / `increaseAllowance(spender, amount)`, `setApprovalForAll(operator, true)`, EIP-2612 `permit` (spender = `args[1]`), Permit2 `approve(token, spender, amount, expiration)` (spender = `args[1]`);
   - EIP-712 `Permit` / `PermitSingle` / `PermitBatch` signatures, as objects or JSON strings (including `eth_signTypedData_v4` requests);
   - `cast send ... "approve(address,uint256)" <spender>`.
 - **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
 - Approval content that cannot be fully decoded (truncated calldata, tightly packed batches such as Safe `multiSend`, unparsed `cast` commands, very deep or very large batches), or whose explicit fields disagree with the call arguments or calldata, is never treated as screened: it follows `onCheckError` (ask by default).
+- **Chain**: chain ids are read the same way everywhere (names, decimal or hex ids, `eip155:N`). The configured `defaultChain` is used only when no chain is given. An unsupported chain id, or chain ids that disagree, follow `onCheckError`; screening never runs on a guessed network.
 - Only certain revokes are skipped: `setApprovalForAll(operator, false)` and approvals to the zero address. `approve(spender, 0)` with a non-zero spender is ambiguous (an ERC-20 revoke, or an ERC-721 approval of token #0), so the spender is still screened; for a risky or sanctioned spender you are asked instead of the call being blocked, since it may be a revoke. MoneyTools' own check URLs are never checked, so the plugin cannot loop.
+
+Detection is heuristic. It covers the formats above; it is not a replacement for wallet-level transaction and signing controls.
 
 ## Tools for the agent
 
@@ -88,6 +91,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.5**: one chain-id normalizer (hex, decimal, CAIP-2); unsupported or conflicting chain ids follow `onCheckError`; raw EIP-2612, DAI and Permit2 `permit` calldata is decoded and screened.
 - **0.1.4**: `approve(spender, 0)` is screened (may be ERC-721 token #0); JSON-string typed data and `eth_signTypedData_v4` requests are parsed and screened; unreadable signing payloads follow `onCheckError`.
 - **0.1.3**: every approval in a call is screened (nested and batched), strict combine of results, Permit2 `approve` decoded by its ABI, undecodable or conflicting approval content follows `onCheckError`.
 - **0.1.2**: signed payments are checked against the verified quote before sending; atomic daily-budget reservation; user info, query and fragment stripped from checked URLs.
