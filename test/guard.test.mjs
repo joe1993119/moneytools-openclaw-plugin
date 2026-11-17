@@ -49,10 +49,12 @@ test("x402 payment: precheck free tier (200) costs nothing; block verdict blocks
   await g.beforeToolCall({ toolName: "agentcash__fetch", params: { url: "https://good.example/x" } }); assert.equal(n, 2, "cached");
   assert.equal(decidePrecheck(readConfig({}), "u", { verdict: "warn", warnings: ["w"] }).requireApproval.title, "Pay precheck warning");
 });
-test("after the free tier the precheck is paid via AgentCash at 0.005", async () => {
-  let ac = 0; const g = createGuard({ autoPay: true }, { env: {}, fileExists: () => true, fetch: async () => res402(quote(5000)), agentcash: async (u, o) => { ac++; assert.equal(o.maxUsd, 0.005); assert.match(u, /api\.moneytools\.dev\/v1\/precheck\?url=https%3A%2F%2Fs\.example/); return { verdict: "ok" }; } });
-  assert.equal(await g.beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p" } }), undefined);
-  assert.equal(ac, 1); assert.equal(g.budget.spentUsd, 0.005);
+test("AgentCash never pays automatically, even with autoPay on: the user is asked and nothing is paid", async () => {
+  let ac = 0; const g = createGuard({ autoPay: true }, { env: {}, fileExists: () => true, fetch: async () => res402(quote(5000)), agentcash: async () => { ac++; return { verdict: "ok" }; } });
+  const d = await g.beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p" } });
+  assert.match(d.requireApproval.description, /never charged automatically/); assert.equal(ac, 0); assert.equal(g.budget.spentUsd, 0);
+  const gb = createGuard({ autoPay: true, onCheckError: "block" }, { env: {}, fileExists: () => true, fetch: async () => res402(quote(20000)), agentcash: async () => { ac++; return {}; } });
+  assert.equal((await gb.beforeToolCall({ toolName: "send_transaction", params: approveTx })).block, true); assert.equal(ac, 0);
 });
 test("no wallet / budget reached / overpriced quote: nothing is paid and the user is asked (default)", async () => {
   const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async () => res402(quote(20000)) });
@@ -74,7 +76,7 @@ test("default is opt-in: autoPay is false, cap 0.25; without autoPay nothing is 
   assert.ok((await g.beforeToolCall({ toolName: "send_transaction", params: approveTx })).requireApproval); assert.equal(x.calls.length, 0);
 });
 test("registerGuard wires before_tool_call and two tools on an OpenClaw-like api", async () => {
-  const hooks = [], tools = []; const T = { Object: (p) => ({ type: "object", properties: p }), String: (o) => ({ type: "string", ...o }), Optional: (s) => s };
+  const hooks = [], tools = []; const T = { Object: (p) => ({ type: "object", properties: p }), String: (o) => ({ type: "string", ...o }), Boolean: (o) => ({ type: "boolean", ...o }), Optional: (s) => s };
   registerGuard({ pluginConfig: {}, logger: { info() {} }, on: (n, h, o) => hooks.push([n, h, o]), registerTool: (t) => tools.push(t) }, T, { env: {}, fileExists: () => false, fetch: async () => res200({ verdict: "ok" }) });
   assert.equal(hooks[0][0], "before_tool_call"); assert.deepEqual(tools.map((t) => t.name), ["moneytools_pay_precheck", "moneytools_wallet_risk"]);
   const out = await tools[0].execute("1", { url: "https://s.example/" }); assert.equal(out.details.verdict, "ok"); assert.equal(out.details.paidUsd, 0);
@@ -143,7 +145,7 @@ test("finding 3: user info, query string and fragment never leave the agent", as
   assert.equal(seen.length, 2); for (const s of seen) assert.ok(!/SECRET|key%3D|access_token|u%3Ap/.test(s), s);
 });
 import { toolDefs } from "../src/guard.js";
-const toolDefsFor = (g) => toolDefs(g, { Object: (p) => p, String: (o) => o, Optional: (s) => s })[0];
+const toolDefsFor = (g) => toolDefs(g, { Object: (p) => p, String: (o) => o, Boolean: (o) => o, Optional: (s) => s })[0];
 
 // --- 0.1.3: strict combine over every approval in a call ---
 import { combineDecisions } from "../src/guard.js";
@@ -202,4 +204,47 @@ test("raw EIP-2612 permit calldata to a high-risk spender is blocked; a hex chai
   assert.equal((await g.beforeToolCall({ toolName: "send_transaction", params: { data: pd, chainId: "0x1" } })).block, true);
   assert.match(seen[0], /chain=ethereum/);
   const d = await g.beforeToolCall({ toolName: "send_transaction", params: { data: pd, chainId: "0x1234567" } }); assert.ok(d.requireApproval); assert.match(d.requireApproval.description, /unsupported chain/);
+});
+
+// --- 0.1.6: AgentCash pays only after a per-check user confirmation; every approval judged separately ---
+const T6 = { Object: (p) => p, String: (o) => o, Boolean: (o) => o, Optional: (s) => s };
+test("AgentCash: a paid check runs only after OpenClaw reports allow-once for that exact tool call; deny, timeout or no hook pays nothing", async () => {
+  let ac = 0; const g = createGuard({}, { env: {}, fileExists: () => true, fetch: async () => res402(quote(20000)), agentcash: async (u, o) => { ac++; assert.equal(o.maxUsd, 0.02); return { level: "low" }; } });
+  const tool = toolDefs(g, T6)[1]; const params = { address: SP, chain: "base", payWithAgentcash: true };
+  // without the hook / confirmation: refused, nothing paid
+  assert.equal((await tool.execute("call-1", params)).details.error, "confirm_required"); assert.equal(ac, 0);
+  // hook asks; deny -> refused
+  const ask = await g.beforeToolCall({ toolName: "moneytools_wallet_risk", params, toolCallId: "call-2" });
+  assert.match(ask.requireApproval.description, /0\.02 USDC/); assert.deepEqual(ask.requireApproval.allowedDecisions, ["allow-once", "deny"]);
+  await ask.requireApproval.onResolution("deny"); assert.equal((await tool.execute("call-2", params)).details.error, "confirm_required"); assert.equal(ac, 0);
+  // allow-once -> exactly one paid check for that call id; a second run of the same id is refused
+  const ok = await g.beforeToolCall({ toolName: "moneytools_wallet_risk", params, toolCallId: "call-3" }); await ok.requireApproval.onResolution("allow-once");
+  assert.equal((await tool.execute("call-4", params)).details.error, "confirm_required", "grant is bound to its own call id");
+  const r = await tool.execute("call-3", params); assert.equal(r.details.level, "low"); assert.equal(r.details.paidUsd, 0.02); assert.equal(ac, 1); assert.equal(g.budget.spentUsd, 0.02);
+  assert.equal((await tool.execute("call-3", { ...params, address: BADSP })).details.error, "confirm_required"); assert.equal(ac, 1);
+  // expired confirmation
+  let t = 0; const g2 = createGuard({}, { env: {}, now: () => t, fileExists: () => true, fetch: async () => res402(quote(5000)), agentcash: async () => { ac++; return { verdict: "ok" }; } });
+  const p2 = { url: "https://s.example/p", payWithAgentcash: true }; const a2 = await g2.beforeToolCall({ toolName: "moneytools_pay_precheck", params: p2, toolCallId: "c" }); await a2.requireApproval.onResolution("allow-once");
+  t = 10 * 60000; assert.equal((await toolDefs(g2, T6)[0].execute("c", p2)).details.error, "confirm_required"); assert.equal(ac, 1);
+  // key wallet + autoPay still pays automatically
+  const x = fakeX402({ level: "low" }); const gk = createGuard({ autoPay: true }, { env: KEYENV, fileExists: () => true, fetch: x.paidFetch(quote(20000)), x402: x.mods });
+  assert.equal(await gk.beforeToolCall({ toolName: "send_transaction", params: approveTx }), undefined); assert.equal(x.calls.length, 1);
+});
+test("every approval is judged on its own: zero-then-unlimited to a high-risk spender is blocked in either order, with one risk lookup", async () => {
+  const zero = "0x095ea7b3" + BADSP.slice(2).padStart(64, "0") + "0".repeat(64); const unl = appr(BADSP);
+  for (const calls of [[{ data: zero }, { data: unl }], [{ data: unl }, { data: zero }]]) {
+    const seen = []; const f = riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } });
+    const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async (u) => { seen.push(u); return f(u); } });
+    const d = await g.beforeToolCall({ toolName: "wallet_sendCalls", params: { calls, chainId: 8453 } });
+    assert.equal(d.block, true); assert.match(d.blockReason, /UNLIMITED/); assert.equal(seen.length, 1, "one lookup per spender");
+  }
+  // sanctioned spender: positive grant blocked even next to a zero-amount op
+  const gs = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", sanctioned: true } }) });
+  assert.equal((await gs.beforeToolCall({ toolName: "wallet_sendCalls", params: { calls: [{ data: zero }, { data: "0x095ea7b3" + BADSP.slice(2).padStart(64, "0") + "5".padStart(64, "0") }] } })).block, true);
+});
+test("approvals to the same spender on different tokens are all kept and named in the decision", async () => {
+  const T1 = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", T2 = "0x4200000000000000000000000000000000000006";
+  const g = createGuard({ onMediumRisk: "approve" }, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "medium", riskScore: 50 } }) });
+  const d = await g.beforeToolCall({ toolName: "wallet_sendCalls", params: { calls: [{ to: T1, data: appr(BADSP) }, { to: T2, data: "0x095ea7b3" + BADSP.slice(2).padStart(64, "0") + "64".padStart(64, "0") }] } });
+  assert.match(d.requireApproval.title, /2 checks/); assert.match(d.requireApproval.description, new RegExp(T1)); assert.match(d.requireApproval.description, new RegExp(T2)); assert.match(d.requireApproval.description, /UNLIMITED/); assert.match(d.requireApproval.description, /of 100/);
 });

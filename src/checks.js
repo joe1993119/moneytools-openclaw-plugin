@@ -15,7 +15,7 @@ export const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 export const BASE = "eip155:8453";
 export const PRICES = { precheck: 0.005, walletRisk: 0.02 };
 export const AGENTCASH_VERSION = "0.17.1"; // pinned; never @latest
-const UA = "moneytools-openclaw-plugin/0.1.5";
+const UA = "moneytools-openclaw-plugin/0.1.6";
 
 export class CheckError extends Error { constructor(code, message) { super(message); this.code = code; } }
 
@@ -94,12 +94,15 @@ export function runAgentcash(url, { timeoutMs = 60000, spawnFn = spawn, maxUsd }
 }
 
 /** GET a MoneyTools check. Free tier first (unpaid request); on 402 verify the quote, then pay from the agent's wallet. */
-export async function callCheck(url, { maxUsd, payer, env = process.env, fetch: f = globalThis.fetch, x402, agentcash = runAgentcash, budget, now } = {}) {
+export async function callCheck(url, { maxUsd, payer, env = process.env, fetch: f = globalThis.fetch, x402, agentcash = runAgentcash, budget, now, agentcashConfirmed = false } = {}) {
   const first = await f(url, { headers: { accept: "application/json", "user-agent": UA } });
   if (first.status === 200) return { data: await first.json(), paidUsd: 0 };
   if (first.status !== 402) { const j = await first.json().catch(() => ({})); throw new CheckError(j.error || `http_${first.status}`, j.message || `MoneyTools returned HTTP ${first.status}`); }
   const quote = verifyQuote(first, await first.json().catch(() => null), maxUsd);
   if (!payer || payer.kind === "none") throw new CheckError("no_payer", payer?.reason || "no wallet configured to pay for the check");
+  // AgentCash signs in its own process, so its payment cannot be bound to the quote verified here. It never pays automatically:
+  // only after the user confirms that one paid check (moneytools_* tool with payWithAgentcash: true, approved in OpenClaw).
+  if (payer.kind === "agentcash" && !agentcashConfirmed) throw new CheckError("confirm_required", `this check costs ${quote.amountUsd} USDC after the free tier; AgentCash wallets are never charged automatically. To pay it, run the moneytools tool with payWithAgentcash: true and confirm`);
   // Reserve before any await so concurrent checks cannot both pass the cap; released if the payment does not complete.
   const hold = budget ? budget.reserve(quote.amountUsd) : null;
   if (budget && !hold) throw new CheckError("budget", `daily check budget reached (${budget.limitUsd} USDC)`);

@@ -15,7 +15,7 @@ Paid checks are **opt-in** (`autoPay: true`); by default the plugin uses only th
 openclaw plugins install @moneytools-dev/openclaw-plugin && openclaw plugins enable moneytools-guard
 ```
 
-To let it pay for checks automatically (opt-in, capped at 0.25 USDC/day by default):
+To let it pay for checks automatically from the agent's key wallet (`X402_PRIVATE_KEY`; opt-in, capped at 0.25 USDC/day by default):
 
 ```bash
 openclaw config set plugins.entries.moneytools-guard.config.autoPay true
@@ -28,8 +28,10 @@ The plugin is off until you enable it, and it spends nothing until you set `auto
 ## What it spends, and from which wallet
 
 - **Payer** (`payer: "auto"`): the EVM key in `X402_PRIVATE_KEY` if set (the same variable AgentCash and x402 clients use), otherwise an existing AgentCash wallet (`~/.agentcash/wallet.json`, paid through the pinned `agentcash@0.17.1` CLI). The plugin never reads the AgentCash wallet file; it only checks that it exists. If neither is present, only the free tier is used.
+- **Automatic payment uses the key wallet only.** With `autoPay: true`, checks after the free tier are paid automatically only from `X402_PRIVATE_KEY`, where the plugin verifies the signed payment itself (below).
+- **AgentCash never pays automatically.** AgentCash signs inside its own process, so its payment cannot be bound to the quote the plugin verified. With an AgentCash wallet, automatic checks use the free tier; when a check needs payment you are asked (per `onCheckError`) and nothing is paid. To pay one check from AgentCash, the agent calls `moneytools_wallet_risk` or `moneytools_pay_precheck` with `payWithAgentcash: true`; OpenClaw then asks you to confirm that single payment (allow once / deny). The confirmation is bound to that tool call, used once, and expires after 2 minutes; AgentCash is still limited to x402 on Base and the published price (`--max-amount`).
 - **Price guard**: before paying, the plugin reads the 402 quote and pays only if it is USDC on Base, payTo is the MoneyTools wallet `0x64eB63904Cf9688AC5B3087A72AcF9C31a273169`, and the amount is at most the published price (0.005 or 0.02 USDC).
-- **Signed-payment check**: with a key payer, the plugin signs only the single verified requirement, then checks the signed authorization (amount, USDC, Base, payTo, validity window) against the quote before sending it. One paid request, no automatic retry. With the AgentCash payer, AgentCash is limited to x402 on Base and to the quoted price (`--max-amount`).
+- **Signed-payment check**: with a key payer, the plugin signs only the single verified requirement, then checks the signed authorization (amount, USDC, Base, payTo, validity window) against the quote before sending it. One paid request, no automatic retry.
 - **Daily cap**: `dailyBudgetUsd` (default 0.25 USDC per UTC day, max 5). Spend is reserved before each payment starts, so parallel checks cannot exceed the cap; a payment that does not complete gives its reservation back. Identical checks running at the same time share one payment.
 - **What is sent**: only the scheme, host, port and path of the URL being checked. User info, query strings and fragments (API keys, signed links) are dropped before the precheck request and are not logged.
 - **Cache**: the same URL or spender is not checked again for `cacheMinutes` (default 10).
@@ -60,7 +62,7 @@ The plugin uses OpenClaw's `before_tool_call` hook.
   - structured calls decoded by their ABI: `approve` / `increaseAllowance(spender, amount)`, `setApprovalForAll(operator, true)`, EIP-2612 `permit` (spender = `args[1]`), Permit2 `approve(token, spender, amount, expiration)` (spender = `args[1]`);
   - EIP-712 `Permit` / `PermitSingle` / `PermitBatch` signatures, as objects or JSON strings (including `eth_signTypedData_v4` requests);
   - `cast send ... "approve(address,uint256)" <spender>`.
-- **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
+- **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The Wallet Risk Card is fetched once per spender, but every approval is judged on its own (amount, unlimited, token, revoke status): a positive grant never inherits the softer treatment of a zero-amount operation next to it. The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
 - Approval content that cannot be fully decoded (truncated calldata, tightly packed batches such as Safe `multiSend`, unparsed `cast` commands, very deep or very large batches), or whose explicit fields disagree with the call arguments or calldata, is never treated as screened: it follows `onCheckError` (ask by default).
 - **Chain**: chain ids are read the same way everywhere (names, decimal or hex ids, `eip155:N`). The configured `defaultChain` is used only when no chain is given. An unsupported chain id, or chain ids that disagree, follow `onCheckError`; screening never runs on a guessed network.
 - Only certain revokes are skipped: `setApprovalForAll(operator, false)` and approvals to the zero address. `approve(spender, 0)` with a non-zero spender is ambiguous (an ERC-20 revoke, or an ERC-721 approval of token #0), so the spender is still screened; for a risky or sanctioned spender you are asked instead of the call being blocked, since it may be a revoke. MoneyTools' own check URLs are never checked, so the plugin cannot loop.
@@ -69,8 +71,8 @@ Detection is heuristic. It covers the formats above; it is not a replacement for
 
 ## Tools for the agent
 
-- `moneytools_pay_precheck { url, method? }`
-- `moneytools_wallet_risk { address, chain? }`, where chain is one of base, ethereum, arbitrum, optimism, polygon, bsc or avalanche.
+- `moneytools_pay_precheck { url, method?, payWithAgentcash? }`
+- `moneytools_wallet_risk { address, chain?, payWithAgentcash? }`, where chain is one of base, ethereum, arbitrum, optimism, polygon, bsc or avalanche.
 
 ## Config example (`openclaw.json`)
 
@@ -91,6 +93,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.6**: AgentCash never pays automatically (key-wallet autoPay unchanged); an AgentCash-paid check needs a per-call user confirmation. Risk is looked up once per spender, but every approval is judged separately.
 - **0.1.5**: one chain-id normalizer (hex, decimal, CAIP-2); unsupported or conflicting chain ids follow `onCheckError`; raw EIP-2612, DAI and Permit2 `permit` calldata is decoded and screened.
 - **0.1.4**: `approve(spender, 0)` is screened (may be ERC-721 token #0); JSON-string typed data and `eth_signTypedData_v4` requests are parsed and screened; unreadable signing payloads follow `onCheckError`.
 - **0.1.3**: every approval in a call is screened (nested and batched), strict combine of results, Permit2 `approve` decoded by its ABI, undecodable or conflicting approval content follows `onCheckError`.

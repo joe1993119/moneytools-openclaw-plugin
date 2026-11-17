@@ -1,8 +1,8 @@
 {
   "id": "moneytools-guard",
   "name": "MoneyTools Guard",
-  "description": "Pay precheck before every x402 payment (0.005 USDC) and a Wallet Risk Card before every token approval (0.02 USDC); blocks sanctioned or high-risk spenders. Paid checks are opt-in (autoPay) and paid from the agent's own wallet (X402_PRIVATE_KEY or an existing AgentCash wallet); daily cap 0.25 USDC by default; failed checks are not charged.",
-  "version": "0.1.5",
+  "description": "Pay precheck before every x402 payment (0.005 USDC) and a Wallet Risk Card before every token approval (0.02 USDC); blocks sanctioned or high-risk spenders. Paid checks are opt-in: automatic payment (autoPay) uses only the agent's own key wallet (X402_PRIVATE_KEY); an AgentCash wallet pays only for a check the user confirms; daily cap 0.25 USDC by default; failed checks are not charged.",
+  "version": "0.1.6",
   "categories": ["security"],
   "enabledByDefault": false,
   "activation": { "onStartup": true },
@@ -12,7 +12,7 @@
     "additionalProperties": false,
     "properties": {
       "autoPay": { "type": "boolean", "default": false, "description": "Opt-in. true = pay for checks automatically from the agent's wallet after the free tier (capped by dailyBudgetUsd). Default false = free tier only; checks that need payment ask you instead." },
-      "payer": { "type": "string", "enum": ["auto", "key", "agentcash", "none"], "default": "auto", "description": "auto: X402_PRIVATE_KEY if set, else an existing AgentCash wallet (~/.agentcash/wallet.json), else free tier only." },
+      "payer": { "type": "string", "enum": ["auto", "key", "agentcash", "none"], "default": "auto", "description": "auto: X402_PRIVATE_KEY if set (pays automatically when autoPay is true), else an existing AgentCash wallet (~/.agentcash/wallet.json), which never pays automatically: only for a check the user confirms. Else free tier only." },
       "privateKeyEnv": { "type": "string", "default": "X402_PRIVATE_KEY", "description": "Name of the env var holding the agent's EVM private key (USDC on Base). The key never leaves the Gateway process." },
       "dailyBudgetUsd": { "type": "number", "minimum": 0, "maximum": 5, "default": 0.25, "description": "Max USDC per UTC day this plugin may spend on its own checks." },
       "precheckPayments": { "type": "boolean", "default": true },

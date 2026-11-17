@@ -192,7 +192,7 @@ export function detectApprovals(toolName, params, opts = {}) {
   const name = String(toolName || ""); const approvals = [], problems = [];
   if (/^moneytools_/i.test(name)) return { approvals, problems };
   const ops = [];
-  const visit = (v, chain, depth, explicit = false) => {
+  const visit = (v, chain, depth, explicit = false, to = null) => {
     if (depth > MAX_DEPTH) { if (v && typeof v === "object") problems.push("transaction data nested too deeply to screen"); return; }
     if (typeof v === "string") {
       const t = v.trim();
@@ -200,27 +200,28 @@ export function detectApprovals(toolName, params, opts = {}) {
         const looksSigning = /primaryType|permit|spender|"data"\s*:\s*"0x|approve/i.test(t);
         if (t.length > MAX_JSON) { if (looksSigning) problems.push("serialized signing/transaction payload too large to screen"); return; }
         let parsed; try { parsed = JSON.parse(t); } catch { if (looksSigning) problems.push("serialized signing/transaction payload could not be parsed"); return; }
-        visit(parsed, chain, depth + 1, explicit); return;
+        visit(parsed, chain, depth + 1, explicit, to); return;
       }
       if (!/^0x[0-9a-fA-F]{8}/.test(v) || v.length === 42 || v.length === 66) return; // addresses and hashes are not calldata
       const sel = SELECTORS[v.slice(0, 10).toLowerCase()];
-      if (sel) { const d = decodeCalldata(v); if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata" }); else if (!d && !isRevoke(v, sel)) problems.push(`${sel.fn} calldata could not be decoded`); }
+      if (sel) { const d = decodeCalldata(v); if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata", ...(to ? { token: to } : {}) }); else if (!d && !isRevoke(v, sel)) problems.push(`${sel.fn} calldata could not be decoded`); }
       else if (v.length > 10 + 128) embeddedApprovals(v, ops, problems, chain);
       return;
     }
-    if (Array.isArray(v)) { if (v.length > MAX_ITEMS) problems.push("transaction batch too large to screen"); for (const x of v.slice(0, MAX_ITEMS)) visit(x, chain, depth + 1, explicit); return; }
+    if (Array.isArray(v)) { if (v.length > MAX_ITEMS) problems.push("transaction batch too large to screen"); for (const x of v.slice(0, MAX_ITEMS)) visit(x, chain, depth + 1, explicit, null); return; }
     if (!isObj(v)) return;
     const own = chainFrom(v);
     // A nested object may not silently switch away from a chain its parent declared explicitly.
     const ch = !own ? chain : explicit && chain !== own && !own.startsWith("?") && !chain.startsWith("?") ? `?conflict:${chain}/${own}` : own;
     const isExplicit = explicit || !!own; const keys = Object.keys(v);
     if (keys.length > MAX_ITEMS) problems.push("transaction object too large to screen");
-    const st = structuredApproval(v, ch, problems); if (st) ops.push(st);
+    const txTo = isAddr(v.to) ? v.to : isAddr(v.address) ? v.address : isAddr(v.contract) ? v.contract : null;
+    const st = structuredApproval(v, ch, problems); if (st) { if (txTo) st.token = txTo; ops.push(st); }
     signingAdapter(v, problems);
     ops.push(...typedDataApprovals(v, ch, problems));
     // calldata in the same object must agree with the structured call
     if (st && typeof v.data === "string") { const d = decodeCalldata(v.data); if (d && d.spender.toLowerCase() !== st.spender.toLowerCase()) problems.push(`structured ${st.fn} spender ${st.spender} disagrees with calldata spender ${d.spender}`); }
-    for (const k of keys.slice(0, MAX_ITEMS)) visit(v[k], ch, depth + 1, isExplicit);
+    for (const k of keys.slice(0, MAX_ITEMS)) visit(v[k], ch, depth + 1, isExplicit, txTo);
   };
   visit(params, chainOf(params, opts.defaultChain || "base"), 0, false);
   if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
@@ -233,7 +234,9 @@ export function detectApprovals(toolName, params, opts = {}) {
   const seen = new Set();
   for (const o of ops) {
     // Never screen on a guessed network: unsupported or conflicting chain identifiers go to onCheckError.
-    if (o.chain.startsWith("?")) { const [kind, val] = o.chain.slice(1).split(/:(.*)/); problems.push(`${o.fn} to ${o.spender}: ${kind === "conflict" ? "conflicting chain identifiers" : "unsupported chain"} ${val}`); continue; } const k = `${o.chain}:${o.spender.toLowerCase()}:${o.fn}`; if (!seen.has(k)) { seen.add(k); approvals.push(o); } }
+    if (o.chain.startsWith("?")) { const [kind, val] = o.chain.slice(1).split(/:(.*)/); problems.push(`${o.fn} to ${o.spender}: ${kind === "conflict" ? "conflicting chain identifiers" : "unsupported chain"} ${val}`); continue; } 
+    // Only exact duplicates are merged; every operation with a different fn, token, amount or revoke status is kept and judged on its own.
+    const k = JSON.stringify([o.chain, o.spender.toLowerCase(), o.fn, (o.token || "").toLowerCase(), o.amount ?? null, !!o.unlimited, !!o.ambiguousZero, o.expiration ?? null]); if (!seen.has(k)) { seen.add(k); approvals.push(o); } }
   if (approvals.length > MAX_OPS) { problems.push(`${approvals.length} approvals in one call; only the first ${MAX_OPS} are screened`); approvals.length = MAX_OPS; }
   return { approvals, problems: [...new Set(problems)] };
 }

@@ -34,9 +34,10 @@ export function decidePrecheck(cfg, url, r) {
 /** Decision for a Wallet Risk Card (https://tools.moneytools.dev/v1/wallet-risk) on the approval spender. */
 export function decideRisk(cfg, a, card) {
   const level = String(card?.level || "").toLowerCase(); const head = `${card?.headline || `risk ${card?.riskScore ?? "?"}/100`} (grade ${card?.grade ?? "?"})`;
-  const what = `${a.unlimited ? "an UNLIMITED " : "a "}${a.fn} to spender ${a.spender} on ${a.chain}`;
+  const what = `${a.unlimited ? "an UNLIMITED " : a.ambiguousZero ? "a zero-amount / token #0 " : "a "}${a.fn}${a.amount !== undefined && !a.unlimited && !a.ambiguousZero ? ` of ${a.amount}` : ""} to spender ${a.spender}${a.token ? ` (token ${a.token})` : ""} on ${a.chain}`;
   // approve(spender, 0) may be an ERC-20 revoke or an ERC-721 approval of token #0: never silently allowed for a risky spender, never auto-blocked either (it may be a revoke).
-  if (a.ambiguousZero && (card?.sanctioned === true || ["high", "critical", "medium"].includes(level))) return approval(card?.sanctioned ? "Sanctioned spender" : "Check this spender", `Wallet Risk Card for approve(${a.spender}, 0) on ${a.chain}: ${card?.sanctioned ? "spender is on the OFAC SDN list; " : ""}${head}. This is either an ERC-20 revoke (safe) or an ERC-721 approval of token #0 (grants that NFT). Continue?`, card?.sanctioned || level !== "medium" ? "critical" : "warning");
+  // Applies only to this exact zero-amount operation; any positive or unlimited grant in the same call is judged by the rules below.
+  if (a.ambiguousZero === true && !a.unlimited && (card?.sanctioned === true || ["high", "critical", "medium"].includes(level))) return approval(card?.sanctioned ? "Sanctioned spender" : "Check this spender", `Wallet Risk Card for approve(${a.spender}, 0) on ${a.chain}: ${card?.sanctioned ? "spender is on the OFAC SDN list; " : ""}${head}. This is either an ERC-20 revoke (safe) or an ERC-721 approval of token #0 (grants that NFT). Continue?`, card?.sanctioned || level !== "medium" ? "critical" : "warning");
   if (card?.sanctioned === true) return { block: true, blockReason: `MoneyTools Wallet Risk Card: spender ${a.spender} is on the OFAC SDN list. Blocked ${what}.` };
   if (level === "high" || level === "critical") return cfg.onHighRisk === "approve" ? approval("High-risk spender", `Wallet Risk Card for ${what}: ${head}. Approve anyway?`, "critical") : { block: true, blockReason: `MoneyTools Wallet Risk Card: high risk for ${what}: ${head}.` };
   if (level === "medium") return cfg.onMediumRisk === "allow" ? undefined : cfg.onMediumRisk === "block" ? { block: true, blockReason: `MoneyTools Wallet Risk Card: medium risk for ${what}: ${head}.` } : approval("Check this spender", `Wallet Risk Card for ${what}: ${head}. Approve?`, "warning");
@@ -66,16 +67,32 @@ export function createGuard(rawCfg, deps = {}) {
     const p = (async () => { try { const v = await fn(); cache.set(key, { v, at: now() }); if (cache.size > 500) cache.delete(cache.keys().next().value); return v; } finally { inflight.delete(key); } })();
     inflight.set(key, p); return p;
   }
-  const run = (url, maxUsd) => callCheck(url, { maxUsd, payer: payer(), env, fetch: deps.fetch || globalThis.fetch, x402: deps.x402, agentcash: deps.agentcash, budget, now: deps.now });
-  const precheck = async (target, method) => { const t = sanitizeTargetUrl(target); return cached(`p:${method}:${t}`, () => run(precheckUrl(t, method), PRICES.precheck)); };
-  const walletRisk = (address, chain) => cached(`w:${chain}:${address.toLowerCase()}`, () => run(walletRiskUrl(address, chain), PRICES.walletRisk));
+  // confirmed = the user approved this one paid check in OpenClaw; only then may an AgentCash wallet pay.
+  const agentcashPayer = () => resolvePayer({ ...cfg, payer: "agentcash" }, env, deps.fileExists);
+  const run = (url, maxUsd, confirmed = false) => callCheck(url, { maxUsd, payer: confirmed ? agentcashPayer() : payer(), agentcashConfirmed: confirmed, env, fetch: deps.fetch || globalThis.fetch, x402: deps.x402, agentcash: deps.agentcash, budget, now: deps.now });
+  const precheck = async (target, method, { agentcashConfirmed = false } = {}) => { const t = sanitizeTargetUrl(target); return cached(`p:${method}:${t}${agentcashConfirmed ? ":ac" : ""}`, () => run(precheckUrl(t, method), PRICES.precheck, agentcashConfirmed)); };
+  const walletRisk = (address, chain, { agentcashConfirmed = false } = {}) => cached(`w:${chain}:${address.toLowerCase()}${agentcashConfirmed ? ":ac" : ""}`, () => run(walletRiskUrl(address, chain), PRICES.walletRisk, agentcashConfirmed));
+
+  // One-time user confirmations for AgentCash-paid checks, recorded only when OpenClaw reports "allow-once" for that tool call.
+  const grants = new Map(); const GRANT_MS = 120000;
+  const grantKey = (name, params, id) => id ? `id:${id}` : `p:${name}:${JSON.stringify(params)}`;
+  function takeGrant(name, params, id) {
+    for (const k of [grantKey(name, params, id), grantKey(name, params, null)]) { const g = grants.get(k); if (g) { grants.delete(k); if (now() <= g) return true; } }
+    return false;
+  }
 
   async function beforeToolCall(event, ctx = {}) {
     const name = event?.toolName || ctx.toolName; const params = event?.params || {}; const opts = { paymentToolPattern: cfg.pattern, defaultChain: cfg.defaultChain, toolKind: event?.toolKind || ctx.toolKind };
+    if (/^moneytools_(pay_precheck|wallet_risk)$/.test(name || "") && params.payWithAgentcash === true) {
+      const price = name === "moneytools_wallet_risk" ? PRICES.walletRisk : PRICES.precheck; const id = event?.toolCallId || ctx.toolCallId; const key = grantKey(name, params, id);
+      const subject = name === "moneytools_wallet_risk" ? `Wallet Risk Card for ${params.address}` : `pay precheck for ${(() => { try { return sanitizeTargetUrl(params.url); } catch { return "an invalid URL"; } })()}`;
+      return { requireApproval: { title: "Pay for a MoneyTools check with AgentCash", description: `Pay up to ${price} USDC on Base from your AgentCash wallet for one ${subject}? AgentCash signs the payment itself (limited to x402 on Base and ${price} USDC). Nothing is paid if you deny.`, severity: "warning", timeoutMs: GRANT_MS, allowedDecisions: ["allow-once", "deny"],
+        onResolution: (d) => { if (d === "allow-once") grants.set(key, now() + GRANT_MS); } } };
+    }
     const parts = [];
     if (cfg.checkApprovals) {
       const { approvals, problems } = detectApprovals(name, params, opts);
-      // Every approval in the call is screened (in parallel; the budget reservation keeps spend under the cap).
+      // One risk lookup per spender (cached, concurrent lookups shared); every approval is then judged on its own.
       parts.push(...await Promise.all(approvals.map(async (a) => {
         try { const { data, paidUsd } = await walletRisk(a.spender, a.chain); log.info?.(`[${PLUGIN_ID}] wallet-risk ${a.spender} ${a.chain}: ${data?.level} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decideRisk(cfg, a, data); }
         catch (e) { return onError(cfg, `Wallet Risk Card for ${a.spender}`, e); } })));
@@ -87,18 +104,20 @@ export function createGuard(rawCfg, deps = {}) {
         catch (e) { parts.push(onError(cfg, "pay precheck", e)); } } }
     return combineDecisions(parts);
   }
-  return { cfg, budget, beforeToolCall, precheck, walletRisk, payer };
+  return { cfg, budget, beforeToolCall, precheck, walletRisk, payer, takeGrant };
 }
 
 const text = (o) => ({ content: [{ type: "text", text: JSON.stringify(o, null, 2) }], details: o });
 export function toolDefs(guard, Type) {
+  const AC = (Type) => Type.Optional(Type.Boolean({ description: "Pay this one check from your AgentCash wallet after the free tier. OpenClaw asks the user to confirm first; without that confirmation nothing is paid." }));
+  const confirmed = (name, p, id) => { if (p.payWithAgentcash !== true) return false; if (!guard.takeGrant(name, p, id)) throw new CheckError("confirm_required", "payWithAgentcash needs the user's confirmation in OpenClaw for this call; nothing was paid"); return true; };
   return [
-    { name: "moneytools_pay_precheck", description: `Check an x402 seller URL before paying: validates its 402 terms (network, amount, asset, payTo) and screens payTo against the OFAC SDN list. Free daily tier, then ${PRICES.precheck} USDC on Base, paid from your own wallet. Failed checks are not charged.`,
-      parameters: Type.Object({ url: Type.String({ description: "x402 endpoint you plan to pay" }), method: Type.Optional(Type.String({ description: "HTTP method of the paid call (default GET)" })) }),
-      async execute(_id, p) { try { const r = await guard.precheck(p.url, (p.method || "GET").toUpperCase()); return text({ ...r.data, paidUsd: r.paidUsd }); } catch (e) { return text({ error: e.code || "error", message: e.message, charged: false }); } } },
-    { name: "moneytools_wallet_risk", description: `Wallet Risk Card for an EVM address or ENS name before you pay, trust or approve it: 0-100 risk score, grade A-F, OFAC SDN match, address checks, open approvals. ${PRICES.walletRisk} USDC on Base, paid from your own wallet. Failed checks are not charged.`,
-      parameters: Type.Object({ address: Type.String({ description: "0x address or ENS name" }), chain: Type.Optional(Type.String({ description: `one of ${[...new Set(Object.values(CHAINS))].join(", ")} (default base)` })) }),
-      async execute(_id, p) { try { const r = await guard.walletRisk(p.address, CHAINS[String(p.chain || "base").toLowerCase()] || "base"); return text({ ...r.data, paidUsd: r.paidUsd }); } catch (e) { return text({ error: e.code || "error", message: e.message, charged: false }); } } },
+    { name: "moneytools_pay_precheck", description: `Check an x402 seller URL before paying: validates its 402 terms (network, amount, asset, payTo) and screens payTo against the OFAC SDN list. Free daily tier, then ${PRICES.precheck} USDC on Base, paid from your own wallet (AgentCash only with payWithAgentcash and your confirmation). Failed checks are not charged.`,
+      parameters: Type.Object({ url: Type.String({ description: "x402 endpoint you plan to pay" }), method: Type.Optional(Type.String({ description: "HTTP method of the paid call (default GET)" })), payWithAgentcash: AC(Type) }),
+      async execute(_id, p) { try { const ac = confirmed("moneytools_pay_precheck", p, _id); const r = await guard.precheck(p.url, (p.method || "GET").toUpperCase(), { agentcashConfirmed: ac }); return text({ ...r.data, paidUsd: r.paidUsd }); } catch (e) { return text({ error: e.code || "error", message: e.message, charged: false }); } } },
+    { name: "moneytools_wallet_risk", description: `Wallet Risk Card for an EVM address or ENS name before you pay, trust or approve it: 0-100 risk score, grade A-F, OFAC SDN match, address checks, open approvals. ${PRICES.walletRisk} USDC on Base, paid from your own wallet (AgentCash only with payWithAgentcash and your confirmation). Failed checks are not charged.`,
+      parameters: Type.Object({ address: Type.String({ description: "0x address or ENS name" }), chain: Type.Optional(Type.String({ description: `one of ${[...new Set(Object.values(CHAINS))].join(", ")} (default base)` })), payWithAgentcash: AC(Type) }),
+      async execute(_id, p) { try { const ac = confirmed("moneytools_wallet_risk", p, _id); const r = await guard.walletRisk(p.address, CHAINS[String(p.chain || "base").toLowerCase()] || "base", { agentcashConfirmed: ac }); return text({ ...r.data, paidUsd: r.paidUsd }); } catch (e) { return text({ error: e.code || "error", message: e.message, charged: false }); } } },
   ];
 }
 
