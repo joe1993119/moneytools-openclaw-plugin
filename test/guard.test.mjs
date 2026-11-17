@@ -179,3 +179,18 @@ test("structured Permit2 approve screens the real spender (args[1]), not the tok
   await g.beforeToolCall({ toolName: "wallet_call", params: { functionName: "approve", args: ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", BADSP, "10", "1800000000"] } });
   assert.equal(seen.length, 1); assert.match(seen[0], /address=0x000000000000000000000000000000000000dead/);
 });
+
+test("approve(spender, 0) to a high-risk or sanctioned spender asks (may be a revoke or an ERC-721 token #0 approval); low risk passes", async () => {
+  const z = "0x095ea7b3" + BADSP.slice(2).padStart(64, "0") + "0".repeat(64);
+  const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } }) });
+  const d = await g.beforeToolCall({ toolName: "send_transaction", params: { data: z } }); assert.equal(d.requireApproval.severity, "critical"); assert.match(d.requireApproval.description, /ERC-721/);
+  const gs = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", sanctioned: true } }) });
+  assert.match((await gs.beforeToolCall({ toolName: "send_transaction", params: { data: z } })).requireApproval.description, /OFAC/);
+  const gl = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({}) });
+  assert.equal(await gl.beforeToolCall({ toolName: "send_transaction", params: { data: z } }), undefined);
+});
+test("JSON-string typed data to a high-risk spender is blocked like the object form", async () => {
+  const td = { primaryType: "PermitSingle", domain: { chainId: 8453 }, message: { details: {}, spender: BADSP } };
+  const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } }) });
+  assert.equal((await g.beforeToolCall({ toolName: "wallet_request", params: { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] } })).block, true);
+});

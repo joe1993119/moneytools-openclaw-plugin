@@ -23,8 +23,8 @@ test("approve: calldata approve(spender, max) on base -> unlimited", () => {
   const a = detectApproval("send_transaction", { to: "0xA0b8...", data: approveData(SP, (1n << 256n) - 1n), chainId: 8453 });
   assert.equal(a.spender, SP); assert.equal(a.chain, "base"); assert.equal(a.unlimited, true); assert.equal(a.fn, "approve");
 });
-test("approve: approve(spender, 0) is a revoke and is not checked; setApprovalForAll(false) ignored", () => {
-  assert.equal(detectApproval("send_transaction", { data: approveData(SP, 0n) }), null);
+test("approve: approve(spender, 0) is ambiguous (ERC-20 revoke / ERC-721 token #0) and still screened; setApprovalForAll(false) ignored", () => {
+  assert.equal(detectApproval("send_transaction", { data: approveData(SP, 0n) }).ambiguousZero, true);
   assert.equal(detectApproval("send_transaction", { data: "0xa22cb465" + pad(SP) + pad("0") }), null);
   assert.equal(detectApproval("send_transaction", { data: "0xa22cb465" + pad(SP) + pad("1"), chain: "ethereum" }).chain, "ethereum");
 });
@@ -68,10 +68,42 @@ test("conflicting or undecodable approval content is reported, never silently sk
   assert.match(detectApprovals("wallet_call", { functionName: "approve", args: ["not-an-address", "1"] }).problems[0], /spender/);
   assert.match(detectApprovals("send_transaction", { data: "0x095ea7b3" + pad(SP) }).problems[0], /could not be decoded/);
   assert.match(detectApprovals("sign_typed_data", { primaryType: "PermitSingle", message: { details: {} } }).problems[0], /spender/);
-  assert.equal(detectApprovals("wallet_call", { functionName: "approve", args: [SP, "0"] }).approvals.length, 0, "revoke");
+  assert.equal(detectApprovals("wallet_call", { functionName: "approve", args: [SP, "0"] }).approvals[0].ambiguousZero, true, "ambiguous zero is screened");
   const deep = {}; let n = deep; for (let i = 0; i < 14; i++) { n.x = {}; n = n.x; } n.data = approveData(BAD, 1n);
   assert.ok(detectApprovals("send_transaction", deep).problems.some((p) => /nested too deeply/.test(p)));
   assert.ok(detectApprovals("exec", { command: `cast send 0xT "approve(address,uint256)" ${SP} 1 && cast send 0xT "approve(address,uint256)" $SPENDER 1` }).problems.length >= 1);
   const two = detectApprovals("exec", { command: `cast send 0xT "approve(address,uint256)" ${SP} 1; cast send 0xT "approve(address,uint256)" ${BAD} 1` });
   assert.equal(two.approvals.length, 2); assert.deepEqual(two.problems, []);
+});
+
+// --- 0.1.3 rescan: ERC-721 token #0 and JSON-serialized typed data ---
+const ZERO = "0x0000000000000000000000000000000000000000";
+test("revocation semantics: only a zero-address spender or setApprovalForAll(false) is a certain revoke; same rule for calldata, structured and batched", () => {
+  // ERC-721 approve(spender, tokenId 0) and ERC-20 approve(spender, 0): screened, flagged ambiguous
+  const c = detectApprovals("send_transaction", { data: approveData(BAD, 0n) }); assert.equal(c.approvals[0].spender, BAD); assert.equal(c.approvals[0].ambiguousZero, true); assert.deepEqual(c.problems, []);
+  const st = detectApprovals("wallet_call", { functionName: "approve", args: [BAD, 0] }); assert.equal(st.approvals[0].ambiguousZero, true);
+  // ERC-721 revoke approve(address(0), tokenId) and zero-address ERC-20 approval: not screened, not a problem
+  for (const r of [detectApprovals("send_transaction", { data: approveData(ZERO, 5n) }), detectApprovals("wallet_call", { functionName: "approve", args: [ZERO, "5"] })]) { assert.equal(r.approvals.length, 0); assert.deepEqual(r.problems, []); }
+  // batched: inner approve(BAD, 0) is screened, inner approve(0x0, 7) is a revoke
+  const inner = (sp, n) => approveData(sp, n).slice(2); const mc = (x) => "0xac9650d8" + pad("20") + pad("1") + pad("20") + pad((x.length / 2).toString(16)) + x + "0".repeat(56);
+  assert.equal(detectApprovals("send_transaction", { data: mc(inner(BAD, 0n)) }).approvals[0].spender, BAD);
+  const rv = detectApprovals("send_transaction", { data: mc(inner(ZERO, 7n)) }); assert.equal(rv.approvals.length, 0); assert.deepEqual(rv.problems, []);
+});
+const permitTD = (primaryType, message, chainId = 8453) => ({ types: { EIP712Domain: [] }, primaryType, domain: { name: "X", chainId, verifyingContract: TOKEN }, message });
+test("typed data: object form and JSON-string form give the same result (EIP-2612 Permit, PermitSingle, PermitBatch), incl. eth_signTypedData_v4", () => {
+  const cases = [permitTD("Permit", { owner: SP, spender: BAD, value: "1", nonce: 0, deadline: 1 }), permitTD("PermitSingle", { details: { token: TOKEN, amount: "1" }, spender: BAD, sigDeadline: 1 }, "0x2105"), permitTD("PermitBatch", { details: [{ token: TOKEN }], spender: BAD, sigDeadline: 1 }, 1)];
+  for (const td of cases) {
+    const a = detectApprovals("sign_typed_data", { typedData: td }).approvals[0]; const b = detectApprovals("sign_typed_data", { typedData: JSON.stringify(td) }).approvals[0];
+    const rpc = detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] }).approvals[0];
+    assert.equal(a.spender, BAD); assert.deepEqual(b, a); assert.deepEqual(rpc, a);
+  }
+  assert.equal(detectApprovals("sign_typed_data", { typedData: JSON.stringify(cases[1]) }).approvals[0].chain, "base");
+});
+test("typed data: malformed, oversized or unreadable signing payloads are reported", () => {
+  assert.match(detectApprovals("sign_typed_data", { typedData: '{"primaryType":"Permit","message":{"spender":' }).problems.join(), /could not be parsed/);
+  const big = JSON.stringify(permitTD("Permit", { spender: BAD, pad: "x".repeat(250000) }));
+  assert.match(detectApprovals("sign_typed_data", { typedData: big }).problems.join(), /too large/);
+  assert.match(detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, "not json"] }).problems.join(), /without readable typed data/);
+  assert.match(detectApprovals("sign_typed_data", { typedData: JSON.stringify(permitTD("PermitSingle", { details: {} })) }).problems.join(), /spender/);
+  assert.deepEqual(detectApprovals("chat", { text: "[1, 2, 3]" }), { approvals: [], problems: [] }, "unrelated JSON is ignored");
 });

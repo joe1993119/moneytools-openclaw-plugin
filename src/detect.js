@@ -70,9 +70,13 @@ function decodeCalldata(data) {
   const spender = "0x" + sw.slice(24);
   if (sel.boolArg !== undefined) { const b = word(data, sel.boolArg); if (!b || BigInt("0x" + b) === 0n) return null; return { fn: sel.fn, spender, unlimited: true }; }
   const aw = word(data, sel.amountArg); if (!aw) return null; const amount = BigInt("0x" + aw); // truncated calldata is undecodable
-  if (sel.fn === "approve" && amount === 0n) return null; // approve(spender, 0) is a revoke
-  const unlimited = amount !== null && (sel.fn === "permit2.approve" ? amount >= (1n << 160n) - 1n : amount >= MAX_UINT256 / 2n);
-  return { fn: sel.fn, spender, amount: amount === null ? null : amount.toString(), unlimited };
+  // approve(addr, uint256) is shared by ERC-20 (amount) and ERC-721 (tokenId): only a zero-address spender is a certain revoke.
+  // A non-zero spender with 0 is ambiguous (ERC-20 revoke or ERC-721 token #0) and is still screened.
+  if (BigInt(spender) === 0n) return null;
+  const unlimited = sel.fn === "permit2.approve" ? amount >= (1n << 160n) - 1n : amount >= MAX_UINT256 / 2n;
+  const out = { fn: sel.fn, spender, amount: amount.toString(), unlimited };
+  if (sel.fn === "approve" && amount === 0n) out.ambiguousZero = true;
+  return out;
 }
 function chainOf(params, fallback) {
   for (const [k, v] of walk(params)) if (/^(chain|chainid|chain_id|network|chainname)$/i.test(k) && (typeof v === "string" || typeof v === "number")) { const c = CHAINS[String(v).toLowerCase()]; if (c) return c; }
@@ -80,7 +84,16 @@ function chainOf(params, fallback) {
 }
 
 const PERMIT2_ONE = /^permit2[._]?approve$/i;
-const MAX_OPS = 20, MAX_DEPTH = 12, MAX_ITEMS = 200;
+const MAX_OPS = 20, MAX_DEPTH = 12, MAX_ITEMS = 200, MAX_JSON = 200000;
+const SIGN_TYPED = /^(eth_signTypedData(_v[34])?|wallet_signTypedData|signTypedData)$/i;
+const typedChain = (id) => { if (id === undefined || id === null) return null; const s = String(id).toLowerCase(); const dec = /^0x[0-9a-f]+$/.test(s) ? BigInt(s).toString() : s; return CHAINS[dec] || null; };
+/** JSON-RPC / signer adapter: a typed-data signing request must carry a typed-data object (or JSON string) we can read. */
+function signingAdapter(v, problems) {
+  const m = v.method ?? v.rpcMethod; if (typeof m !== "string" || !SIGN_TYPED.test(m)) return;
+  const ps = Array.isArray(v.params) ? v.params : isObj(v.params) ? [v.params] : [];
+  const ok = ps.some((p) => isObj(p) ? typeof p.primaryType === "string" : typeof p === "string" && (() => { try { return typeof JSON.parse(p)?.primaryType === "string"; } catch { return false; } })());
+  if (!ok) problems.push(`${m} request without readable typed data`);
+}
 const fnName = (fn) => String(fn).replace(/\(.*$/, "").trim();
 const isAddr = (x) => typeof x === "string" && ADDR.test(x);
 const isUnlimited = (amt, bits = 256) => amt === true || /^(max|unlimited|infinite)$/i.test(String(amt)) || (/^\d+$/.test(String(amt)) && BigInt(String(amt)) >= (bits === 160 ? (1n << 160n) - 1n : MAX_UINT256 / 2n));
@@ -94,7 +107,7 @@ function embeddedApprovals(hex, ops, problems, chain) {
     while (at !== -1) {
       const d = at % 64 === 0 ? decodeCalldata("0x" + body.slice(at)) : null;
       if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata:batch" });
-      else if (at % 64 === 0 && isRevoke("0x" + body.slice(at), SELECTORS[sel])) { /* aligned revoke (amount 0 / false): nothing to screen */ }
+      else if (at % 64 === 0 && isRevoke("0x" + body.slice(at), SELECTORS[sel])) { /* certain revoke (false / zero-address spender): nothing to screen */ }
       else problems.push(`batched calldata contains a ${SELECTORS[sel].fn} call that could not be decoded`);
       at = body.indexOf(s, at + 8);
     }
@@ -108,13 +121,14 @@ function structuredApproval(v, chain, problems) {
   const name = fnName(raw); const sig = /\(([^)]*)\)/.exec(String(raw))?.[1]?.replace(/\s+/g, "") ?? null;
   const args = Array.isArray(v.args) ? v.args : Array.isArray(v.arguments) ? v.arguments : [];
   const lname = name.toLowerCase();
-  let fn = name, spender, amount, unlimited, expiration;
+  let fn = name, spender, amount, unlimited, expiration, ambiguousZero = false;
   const permit2 = PERMIT2_ONE.test(name) || (lname === "approve" && (sig === "address,address,uint160,uint48" || args.length === 4));
   if (permit2) { fn = "permit2.approve"; spender = args[1] ?? v.spender; amount = args[2] ?? v.amount; expiration = args[3] ?? v.expiration; unlimited = isUnlimited(amount, 160); }
   else if (lname === "approve" || lname === "increaseallowance") {
     if (sig && sig !== "address,uint256") { problems.push(`unsupported ${name}(${sig}) signature`); return null; }
     spender = args.length ? args[0] : v.spender; amount = args.length ? args[1] : (v.amount ?? v.value); unlimited = isUnlimited(amount);
-    if (lname === "approve" && /^0+$/.test(String(amount))) return null; // revoke
+    if (isAddr(spender) && BigInt(spender) === 0n) return null; // zero-address spender: certain revoke
+    if (lname === "approve" && /^0+$/.test(String(amount))) ambiguousZero = true; // ERC-20 revoke or ERC-721 token #0: still screened
   } else if (lname === "setapprovalforall") {
     spender = args.length ? args[0] : v.operator; const on = args.length ? args[1] : v.approved;
     if (on === false || on === "false" || on === 0 || on === "0") return null; unlimited = true;
@@ -125,13 +139,13 @@ function structuredApproval(v, chain, problems) {
   for (const k of ["spender", "operator"]) if (isAddr(v[k]) && isAddr(spender) && v[k].toLowerCase() !== spender.toLowerCase()) { problems.push(`${name}: ${k} field ${v[k]} disagrees with the call arguments (${spender})`); return null; }
   if (!isAddr(spender)) { problems.push(`${name} call without a decodable spender`); return null; }
   const op = { fn, spender, chain: chainFrom(v) || chain, unlimited: !!unlimited, via: "structured" };
-  if (amount !== undefined) op.amount = String(amount); if (expiration !== undefined) op.expiration = String(expiration);
+  if (amount !== undefined) op.amount = String(amount); if (expiration !== undefined) op.expiration = String(expiration); if (ambiguousZero) op.ambiguousZero = true;
   return op;
 }
 
 function typedDataApprovals(v, chain, problems) {
   if (typeof v.primaryType !== "string" || !PERMIT_TYPES.test(v.primaryType)) return [];
-  const ch = CHAINS[String(v.domain?.chainId ?? "").toLowerCase()] || chain;
+  const ch = typedChain(v.domain?.chainId) || chain;
   const m = v.message; if (!isObj(m)) { problems.push(`${v.primaryType} signature without a message`); return []; }
   const spender = m.spender ?? m.details?.spender;
   if (!isAddr(spender)) { problems.push(`${v.primaryType} signature without a decodable spender`); return []; }
@@ -147,6 +161,13 @@ export function detectApprovals(toolName, params, opts = {}) {
   const visit = (v, chain, depth) => {
     if (depth > MAX_DEPTH) { if (v && typeof v === "object") problems.push("transaction data nested too deeply to screen"); return; }
     if (typeof v === "string") {
+      const t = v.trim();
+      if (t[0] === "{" || t[0] === "[") { // JSON-serialized payloads (eth_signTypedData_v4 data, stringified txs) are parsed and screened the same way
+        const looksSigning = /primaryType|permit|spender|"data"\s*:\s*"0x|approve/i.test(t);
+        if (t.length > MAX_JSON) { if (looksSigning) problems.push("serialized signing/transaction payload too large to screen"); return; }
+        let parsed; try { parsed = JSON.parse(t); } catch { if (looksSigning) problems.push("serialized signing/transaction payload could not be parsed"); return; }
+        visit(parsed, chain, depth + 1); return;
+      }
       if (!/^0x[0-9a-fA-F]{8}/.test(v) || v.length === 42 || v.length === 66) return; // addresses and hashes are not calldata
       const sel = SELECTORS[v.slice(0, 10).toLowerCase()];
       if (sel) { const d = decodeCalldata(v); if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata" }); else if (!d && !isRevoke(v, sel)) problems.push(`${sel.fn} calldata could not be decoded`); }
@@ -158,6 +179,7 @@ export function detectApprovals(toolName, params, opts = {}) {
     const ch = chainFrom(v) || chain; const keys = Object.keys(v);
     if (keys.length > MAX_ITEMS) problems.push("transaction object too large to screen");
     const st = structuredApproval(v, ch, problems); if (st) ops.push(st);
+    signingAdapter(v, problems);
     ops.push(...typedDataApprovals(v, ch, problems));
     // calldata in the same object must agree with the structured call
     if (st && typeof v.data === "string") { const d = decodeCalldata(v.data); if (d && d.spender.toLowerCase() !== st.spender.toLowerCase()) problems.push(`structured ${st.fn} spender ${st.spender} disagrees with calldata spender ${d.spender}`); }
@@ -176,7 +198,13 @@ export function detectApprovals(toolName, params, opts = {}) {
   if (approvals.length > MAX_OPS) { problems.push(`${approvals.length} approvals in one call; only the first ${MAX_OPS} are screened`); approvals.length = MAX_OPS; }
   return { approvals, problems: [...new Set(problems)] };
 }
-function isRevoke(hex, sel) { const w = word(hex, sel.amountArg ?? sel.boolArg); return w !== null && BigInt("0x" + w) === 0n && word(hex, sel.spenderArg) !== null; }
+/** Certain revokes only: setApprovalForAll(op, false), or any approval to the zero address. Same rule as decodeCalldata. */
+function isRevoke(hex, sel) {
+  const sw = word(hex, sel.spenderArg); if (sw === null) return false;
+  if (BigInt("0x" + sw) === 0n) return word(hex, sel.amountArg ?? sel.boolArg) !== null;
+  if (sel.boolArg !== undefined) { const b = word(hex, sel.boolArg); return b !== null && BigInt("0x" + b) === 0n; }
+  return false;
+}
 
 /** First approval only (kept for compatibility; the guard uses detectApprovals). */
 export function detectApproval(toolName, params, opts = {}) { return detectApprovals(toolName, params, opts).approvals[0] || null; }

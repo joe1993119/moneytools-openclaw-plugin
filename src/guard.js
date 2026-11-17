@@ -35,6 +35,8 @@ export function decidePrecheck(cfg, url, r) {
 export function decideRisk(cfg, a, card) {
   const level = String(card?.level || "").toLowerCase(); const head = `${card?.headline || `risk ${card?.riskScore ?? "?"}/100`} (grade ${card?.grade ?? "?"})`;
   const what = `${a.unlimited ? "an UNLIMITED " : "a "}${a.fn} to spender ${a.spender} on ${a.chain}`;
+  // approve(spender, 0) may be an ERC-20 revoke or an ERC-721 approval of token #0: never silently allowed for a risky spender, never auto-blocked either (it may be a revoke).
+  if (a.ambiguousZero && (card?.sanctioned === true || ["high", "critical", "medium"].includes(level))) return approval(card?.sanctioned ? "Sanctioned spender" : "Check this spender", `Wallet Risk Card for approve(${a.spender}, 0) on ${a.chain}: ${card?.sanctioned ? "spender is on the OFAC SDN list; " : ""}${head}. This is either an ERC-20 revoke (safe) or an ERC-721 approval of token #0 (grants that NFT). Continue?`, card?.sanctioned || level !== "medium" ? "critical" : "warning");
   if (card?.sanctioned === true) return { block: true, blockReason: `MoneyTools Wallet Risk Card: spender ${a.spender} is on the OFAC SDN list. Blocked ${what}.` };
   if (level === "high" || level === "critical") return cfg.onHighRisk === "approve" ? approval("High-risk spender", `Wallet Risk Card for ${what}: ${head}. Approve anyway?`, "critical") : { block: true, blockReason: `MoneyTools Wallet Risk Card: high risk for ${what}: ${head}.` };
   if (level === "medium") return cfg.onMediumRisk === "allow" ? undefined : cfg.onMediumRisk === "block" ? { block: true, blockReason: `MoneyTools Wallet Risk Card: medium risk for ${what}: ${head}.` } : approval("Check this spender", `Wallet Risk Card for ${what}: ${head}. Approve?`, "warning");
