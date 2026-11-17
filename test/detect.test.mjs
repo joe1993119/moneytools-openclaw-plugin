@@ -67,7 +67,7 @@ test("conflicting or undecodable approval content is reported, never silently sk
   assert.match(detectApprovals("wallet_call", { functionName: "approve", args: [SP, "1"], data: approveData(BAD, 1n) }).problems[0], /disagrees/);
   assert.match(detectApprovals("wallet_call", { functionName: "approve", args: ["not-an-address", "1"] }).problems[0], /spender/);
   assert.match(detectApprovals("send_transaction", { data: "0x095ea7b3" + pad(SP) }).problems[0], /could not be decoded/);
-  assert.match(detectApprovals("sign_typed_data", { primaryType: "PermitSingle", message: { details: {} } }).problems[0], /spender/);
+  assert.match(detectApprovals("sign_typed_data", { primaryType: "PermitSingle", types: { PermitSingle: [] }, domain: { name: "Permit2", chainId: 8453, verifyingContract: "0x000000000022D473030F116dDEE9F6B43aC78BA3" }, message: { details: {} } }).problems[0], /spender/);
   assert.equal(detectApprovals("wallet_call", { functionName: "approve", args: [SP, "0"] }).approvals[0].ambiguousZero, true, "ambiguous zero is screened");
   const deep = {}; let n = deep; for (let i = 0; i < 14; i++) { n.x = {}; n = n.x; } n.data = approveData(BAD, 1n);
   assert.ok(detectApprovals("send_transaction", deep).problems.some((p) => /nested too deeply/.test(p)));
@@ -89,13 +89,15 @@ test("revocation semantics: only a zero-address spender or setApprovalForAll(fal
   assert.equal(detectApprovals("send_transaction", { data: mc(inner(BAD, 0n)) }).approvals[0].spender, BAD);
   const rv = detectApprovals("send_transaction", { data: mc(inner(ZERO, 7n)) }); assert.equal(rv.approvals.length, 0); assert.deepEqual(rv.problems, []);
 });
-const permitTD = (primaryType, message, chainId = 8453) => ({ types: { EIP712Domain: [] }, primaryType, domain: { name: "X", chainId, verifyingContract: TOKEN }, message });
+const P2 = "0x000000000022D473030F116dDEE9F6B43aC78BA3";
+const permitTD = (primaryType, message, chainId = 8453) => ({ types: { EIP712Domain: [], [primaryType]: [] }, primaryType, domain: primaryType === "Permit" ? { name: "USD Coin", version: "2", chainId, verifyingContract: TOKEN } : { name: "Permit2", chainId, verifyingContract: P2 }, message });
 test("typed data: object form and JSON-string form give the same result (EIP-2612 Permit, PermitSingle, PermitBatch), incl. eth_signTypedData_v4", () => {
   const cases = [permitTD("Permit", { owner: SP, spender: BAD, value: "1", nonce: 0, deadline: 1 }), permitTD("PermitSingle", { details: { token: TOKEN, amount: "1" }, spender: BAD, sigDeadline: 1 }, "0x2105"), permitTD("PermitBatch", { details: [{ token: TOKEN }], spender: BAD, sigDeadline: 1 }, 1)];
   for (const td of cases) {
     const a = detectApprovals("sign_typed_data", { typedData: td }).approvals[0]; const b = detectApprovals("sign_typed_data", { typedData: JSON.stringify(td) }).approvals[0];
     const rpc = detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] }).approvals[0];
     assert.equal(a.spender, BAD); assert.deepEqual(b, a); assert.deepEqual(rpc, a);
+    assert.deepEqual(detectApprovals("sign_typed_data", { typedData: JSON.stringify(td) }).problems, []);
   }
   assert.equal(detectApprovals("sign_typed_data", { typedData: JSON.stringify(cases[1]) }).approvals[0].chain, "base");
 });
@@ -116,7 +118,7 @@ test("chain ids: 0x1, 1, \"1\", ethereum and eip155:1 give the same screening ch
   const cf = detectApprovals("send_transaction", { data: approveData(SP, 5n), chainId: 1, network: "base" }); assert.equal(cf.approvals.length, 0); assert.match(cf.problems[0], /conflicting/);
   const nest = detectApprovals("wallet_sendCalls", { chainId: "0x1", calls: [{ data: approveData(SP, 5n), chainId: 8453 }] }); assert.equal(nest.approvals.length, 0); assert.match(nest.problems[0], /conflicting/);
   assert.equal(detectApprovals("sign_typed_data", { typedData: { primaryType: "Permit", domain: { chainId: "0xa4b1" }, message: { spender: SP } } }).approvals[0].chain, "arbitrum");
-  assert.match(detectApprovals("sign_typed_data", { typedData: { primaryType: "Permit", domain: { chainId: 999999 }, message: { spender: SP } } }).problems[0], /unsupported chain/);
+  assert.ok(detectApprovals("sign_typed_data", { typedData: { primaryType: "Permit", domain: { chainId: 999999 }, message: { spender: SP } } }).problems.some((p) => /unsupported chain/.test(p)));
   assert.equal(detectApprovals("send_transaction", { data: approveData(SP, 5n) }).approvals[0].chain, "base", "absent -> default");
 });
 const w = (x) => pad(typeof x === "bigint" ? x.toString(16) : x);
@@ -137,4 +139,26 @@ test("raw permit calldata: EIP-2612, DAI permit, Permit2 permit (single and batc
   assert.equal(detectApprovals("wallet_sendCalls", { calls: [{ data: approveData(SP, 1n) }, { data: permitData(SP, BAD, 1n) }] }).approvals.length, 2);
   assert.match(detectApprovals("send_transaction", { data: permitData(SP, BAD, 1n).slice(0, 10 + 64 * 2) }).problems[0], /could not be decoded/);
   assert.match(detectApprovals("send_transaction", { data: "0x2a2d80d1" + w(SP) + w(0x7fffn) }).problems[0], /could not be decoded/);
+});
+
+// --- 0.1.6 rescan: Permit2 witness transfers, domain and type validation ---
+test("Permit2 witness transfers (single and batch, object and JSON string) are screened; domain and types are validated", () => {
+  const w1 = permitTD("PermitWitnessTransferFrom", { permitted: { token: TOKEN, amount: "1000" }, spender: BAD, nonce: "1", deadline: "1800000000", witness: { foo: 1 } });
+  const wb = permitTD("PermitBatchWitnessTransferFrom", { permitted: [{ token: TOKEN, amount: "1" }, { token: P2, amount: "2" }], spender: BAD, nonce: "1", deadline: "1", witness: {} }, "0xa4b1");
+  for (const td of [w1, wb]) for (const form of [td, JSON.stringify(td)]) {
+    const r = detectApprovals("sign_typed_data", { typedData: form }); assert.equal(r.approvals[0].spender, BAD); assert.equal(r.approvals[0].token.toLowerCase(), TOKEN); assert.deepEqual(r.problems, []);
+    const rpc = detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] }); assert.equal(rpc.approvals[0].spender, BAD);
+  }
+  assert.equal(detectApprovals("sign_typed_data", { typedData: wb }).approvals[0].chain, "arbitrum");
+  // wrong verifying contract, missing type definition, missing domain, unknown Permit2 type, unknown permit-like type
+  assert.match(detectApprovals("sign_typed_data", { typedData: { ...w1, domain: { name: "Permit2", chainId: 8453, verifyingContract: BAD } } }).problems.join(), /not the canonical Permit2/);
+  assert.match(detectApprovals("sign_typed_data", { typedData: { ...w1, types: { EIP712Domain: [] } } }).problems.join(), /types do not define/);
+  assert.match(detectApprovals("sign_typed_data", { typedData: { ...w1, domain: undefined } }).problems.join(), /without a domain/);
+  assert.match(detectApprovals("sign_typed_data", { typedData: permitTD("PermitFutureTransfer", { spender: BAD }) }).problems.join(), /unsupported Permit2 typed data/);
+  assert.match(detectApprovals("sign_typed_data", { typedData: { primaryType: "DelegatedApproval", types: {}, domain: {}, message: { to: BAD } } }).problems.join(), /unsupported authorization/);
+  // unrelated typed data is not rejected; an unknown type that names a spender is still screened
+  assert.deepEqual(detectApprovals("sign_typed_data", { typedData: { primaryType: "Mail", types: { Mail: [] }, domain: { name: "Ether Mail" }, message: { contents: "hi" } } }), { approvals: [], problems: [] });
+  assert.equal(detectApprovals("sign_typed_data", { typedData: { primaryType: "Order", types: { Order: [] }, domain: { name: "X" }, message: { spender: BAD } } }).approvals[0].spender, BAD);
+  // signing request whose payload lacks domain/types/message is unreadable
+  assert.match(detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, JSON.stringify({ primaryType: "Permit" })] }).problems.join(), /without readable typed data/);
 });

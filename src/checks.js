@@ -15,7 +15,7 @@ export const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 export const BASE = "eip155:8453";
 export const PRICES = { precheck: 0.005, walletRisk: 0.02 };
 export const AGENTCASH_VERSION = "0.17.1"; // pinned; never @latest
-const UA = "moneytools-openclaw-plugin/0.1.6";
+const UA = "moneytools-openclaw-plugin/0.1.7";
 
 export class CheckError extends Error { constructor(code, message) { super(message); this.code = code; } }
 
@@ -89,15 +89,15 @@ export function runAgentcash(url, { timeoutMs = 60000, spawnFn = spawn, maxUsd }
     p.on("error", (e) => { clearTimeout(t); reject(new CheckError("payer_unavailable", `could not start AgentCash: ${e.message}`)); });
     p.on("close", () => { clearTimeout(t); let j; try { j = JSON.parse(out); } catch { return reject(new CheckError("payer_failed", "AgentCash returned no JSON")); }
       if (j?.success === true && j.data && typeof j.data === "object") return resolve(j.data);
-      reject(new CheckError("payer_failed", String(j?.error?.message || j?.error || "AgentCash payment failed").slice(0, 200))); });
+      reject(new CheckError("payer_failed", "AgentCash payment failed")); }); // AgentCash's own error text is not passed on
   });
 }
 
 /** GET a MoneyTools check. Free tier first (unpaid request); on 402 verify the quote, then pay from the agent's wallet. */
-export async function callCheck(url, { maxUsd, payer, env = process.env, fetch: f = globalThis.fetch, x402, agentcash = runAgentcash, budget, now, agentcashConfirmed = false } = {}) {
+export async function callCheck(url, { maxUsd, payer, env = process.env, fetch: f = globalThis.fetch, x402, agentcash = runAgentcash, budget, now, agentcashConfirmed = false, normalize = normalizeFor(url) } = {}) {
   const first = await f(url, { headers: { accept: "application/json", "user-agent": UA } });
-  if (first.status === 200) return { data: await first.json(), paidUsd: 0 };
-  if (first.status !== 402) { const j = await first.json().catch(() => ({})); throw new CheckError(j.error || `http_${first.status}`, j.message || `MoneyTools returned HTTP ${first.status}`); }
+  if (first.status === 200) return { data: normalize(await first.json().catch(() => null), false), paidUsd: 0 };
+  if (first.status !== 402) { const j = await first.json().catch(() => ({})); const c = errCode(j?.error, first.status); throw new CheckError(c, `MoneyTools returned HTTP ${first.status} (${c})`); }
   const quote = verifyQuote(first, await first.json().catch(() => null), maxUsd);
   if (!payer || payer.kind === "none") throw new CheckError("no_payer", payer?.reason || "no wallet configured to pay for the check");
   // AgentCash signs in its own process, so its payment cannot be bound to the quote verified here. It never pays automatically:
@@ -109,10 +109,10 @@ export async function callCheck(url, { maxUsd, payer, env = process.env, fetch: 
   try {
     let data;
     if (payer.kind === "key") { const r = await payWithKey(url, quote, maxUsd, payer, env, { fetch: f, x402, now }); data = await r.json().catch(() => ({}));
-      if (r.status !== 200) throw new CheckError(data.error || `http_${r.status}`, data.message || `paid check failed with HTTP ${r.status} (not charged)`); }
+      if (r.status !== 200) { const c = errCode(data?.error, r.status); throw new CheckError(c, `paid check failed with HTTP ${r.status} (${c}; not charged)`); } }
     else data = await agentcash(url, { maxUsd: quote.amountUsd });
     hold?.commit();
-    return { data, paidUsd: quote.amountUsd };
+    return { data: normalize(data, true), paidUsd: quote.amountUsd };
   } catch (e) { hold?.release(); throw e; }
 }
 
@@ -122,6 +122,49 @@ export function sanitizeTargetUrl(target) {
   if (!/^https?:$/.test(u.protocol)) throw new CheckError("bad_url", "only http(s) URLs can be prechecked");
   u.username = ""; u.password = ""; u.search = ""; u.hash = ""; return u.toString();
 }
+// ---- Response validation: only allowlisted, typed fields of the MoneyTools responses reach decisions, logs or the model. ----
+// Free text from upstream (summary, headline, flag details, labels, names) is dropped; short summaries are rebuilt locally from codes.
+const CODE = /^[a-z0-9_]{1,64}$/;
+const errCode = (c, status) => (typeof c === "string" && CODE.test(c) ? c : `http_${status}`);
+const codes = (a, max = 20) => (Array.isArray(a) ? a.filter((x) => typeof x === "string" && CODE.test(x)).slice(0, max) : []);
+const int = (x, lo, hi) => (Number.isInteger(x) && x >= lo && x <= hi ? x : null);
+const ADDR_RE = /^0x[0-9a-fA-F]{40}$/;
+function badResponse(paid, why) { const e = new CheckError("bad_response", `MoneyTools returned an unexpected response (${why})${paid ? "; the check was paid but its result was not used" : ""}`); e.charged = !!paid; return e; }
+const PRECHECK_VERDICTS = ["ok", "warn", "block", "not_402"];
+/** Pay precheck response -> { verdict, riskScore, summary, reasons, warnings, recommendedOption, options } */
+export function normalizePrecheck(raw, paid = false) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw badResponse(paid, "not an object");
+  if (!PRECHECK_VERDICTS.includes(raw.verdict)) throw badResponse(paid, "verdict");
+  const riskScore = raw.riskScore === null ? null : int(raw.riskScore, 0, 100); if (raw.riskScore !== null && riskScore === null) throw badResponse(paid, "riskScore");
+  const reasons = codes(raw.reasons), warnings = codes(raw.warnings);
+  const options = (Array.isArray(raw.options) ? raw.options.slice(0, 20) : []).filter((o) => o && typeof o === "object").map((o) => ({
+    index: int(o.index, 0, 19), valid: o.valid === true,
+    network: typeof o.network === "string" && /^[a-z0-9:_-]{1,40}$/i.test(o.network) ? o.network : null,
+    payTo: typeof o.payTo === "string" && ADDR_RE.test(o.payTo) ? o.payTo : null,
+    amountAtomic: typeof o.amountAtomic === "string" && /^\d{1,40}$/.test(o.amountAtomic) ? o.amountAtomic : null,
+    asset: typeof o.asset === "string" && ADDR_RE.test(o.asset) ? o.asset : null,
+    sanctioned: o.sanctions?.hit === true, errors: codes(o.errors, 10), warnings: codes(o.warnings, 10) }));
+  const summary = { ok: "payment requirements look well-formed; payTo not on the OFAC SDN snapshot", warn: `payable, but check warnings: ${warnings.join(", ") || "see warnings"}`,
+    block: `do not pay: ${reasons.join(", ") || "seller terms failed the check"}`, not_402: "the URL did not answer with an x402 402" }[raw.verdict];
+  return { verdict: raw.verdict, riskScore, summary, reasons, warnings, recommendedOption: raw.recommendedOption === null ? null : int(raw.recommendedOption, 0, 19), options };
+}
+const LEVELS = ["minimal", "low", "medium", "high", "critical"], SEVS = ["low", "medium", "high", "critical"];
+/** Wallet Risk Card response -> { address, chain, riskScore, grade, level, sanctioned, headline, flags, approvals } */
+export function normalizeWalletRisk(raw, paid = false) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw badResponse(paid, "not an object");
+  const riskScore = int(raw.riskScore, 0, 100); if (riskScore === null) throw badResponse(paid, "riskScore");
+  if (!LEVELS.includes(raw.level)) throw badResponse(paid, "level");
+  if (typeof raw.grade !== "string" || !/^[A-F]$/.test(raw.grade)) throw badResponse(paid, "grade");
+  if (typeof raw.sanctioned !== "boolean") throw badResponse(paid, "sanctioned");
+  const flags = (Array.isArray(raw.flags) ? raw.flags : []).filter((f) => f && typeof f.code === "string" && CODE.test(f.code) && SEVS.includes(f.severity)).slice(0, 20).map((f) => ({ code: f.code, severity: f.severity }));
+  const ap = raw.approvals && typeof raw.approvals === "object" && !raw.approvals.error ? raw.approvals : null;
+  const approvals = ap ? { open: int(ap.open, 0, 1e6), unlimited: int(ap.unlimited, 0, 1e6), unknownSpender: int(ap.unknownSpender, 0, 1e6), toSanctionedSpender: int(ap.toSanctionedSpender, 0, 1e6) } : null;
+  const headline = raw.sanctioned ? "Do not transact: address is on the OFAC SDN list." : flags.length ? `Risk ${raw.level} (${riskScore}/100): ${flags.slice(0, 3).map((f) => f.code.replace(/_/g, " ")).join("; ")}.` : "No risk flags found in the checks run.";
+  return { address: typeof raw.address === "string" && ADDR_RE.test(raw.address) ? raw.address : null, chain: typeof raw.chain === "string" && /^[a-z]{2,20}$/.test(raw.chain) ? raw.chain : null,
+    riskScore, grade: raw.grade, level: raw.level, sanctioned: raw.sanctioned, headline, flags, approvals };
+}
+export function normalizeFor(url) { return /\/v1\/wallet-risk\b/.test(String(url)) ? normalizeWalletRisk : /\/v1\/precheck\b/.test(String(url)) ? normalizePrecheck : () => { throw new CheckError("bad_url", "not a MoneyTools check URL"); }; }
+
 export const precheckUrl = (target, method = "GET") => `${PRECHECK_URL}?url=${encodeURIComponent(sanitizeTargetUrl(target))}&method=${encodeURIComponent(method)}`;
 export const walletRiskUrl = (address, chain = "base") => `${WALLET_RISK_URL}?address=${encodeURIComponent(address)}&chain=${encodeURIComponent(chain)}`;
 

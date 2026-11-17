@@ -33,6 +33,7 @@ The plugin is off until you enable it, and it spends nothing until you set `auto
 - **Price guard**: before paying, the plugin reads the 402 quote and pays only if it is USDC on Base, payTo is the MoneyTools wallet `0x64eB63904Cf9688AC5B3087A72AcF9C31a273169`, and the amount is at most the published price (0.005 or 0.02 USDC).
 - **Signed-payment check**: with a key payer, the plugin signs only the single verified requirement, then checks the signed authorization (amount, USDC, Base, payTo, validity window) against the quote before sending it. One paid request, no automatic retry.
 - **Daily cap**: `dailyBudgetUsd` (default 0.25 USDC per UTC day, max 5). Spend is reserved before each payment starts, so parallel checks cannot exceed the cap; a payment that does not complete gives its reservation back. Identical checks running at the same time share one payment.
+- **What comes back**: MoneyTools responses are validated against a fixed schema per endpoint. Only typed fields reach decisions, logs and the agent: verdict, risk score, grade, level, sanctioned, and reason, warning and flag codes. Upstream free text (summaries, headlines, flag details, labels) is dropped, and short summaries are rebuilt locally from the codes. A malformed response follows `onCheckError`.
 - **What is sent**: only the scheme, host, port and path of the URL being checked. User info, query strings and fragments (API keys, signed links) are dropped before the precheck request and are not logged.
 - **Cache**: the same URL or spender is not checked again for `cacheMinutes` (default 10).
 - `autoPay` (default `false`): with `false` the plugin never pays; precheck uses its free daily tier, and a check that needs payment (always the Wallet Risk Card) goes to `onCheckError`, which asks you by default.
@@ -60,7 +61,7 @@ The plugin uses OpenClaw's `before_tool_call` hook.
 - **Approval**:
   - calldata with the `approve`, `increaseAllowance`, `setApprovalForAll(true)`, EIP-2612 `permit`, DAI `permit`, Permit2 `approve`, or Permit2 `permit` (single and batch) selector;
   - structured calls decoded by their ABI: `approve` / `increaseAllowance(spender, amount)`, `setApprovalForAll(operator, true)`, EIP-2612 `permit` (spender = `args[1]`), Permit2 `approve(token, spender, amount, expiration)` (spender = `args[1]`);
-  - EIP-712 `Permit` / `PermitSingle` / `PermitBatch` signatures, as objects or JSON strings (including `eth_signTypedData_v4` requests);
+  - EIP-712 signatures, as objects or JSON strings (including `eth_signTypedData_v4` requests): EIP-2612 / DAI `Permit` and every Permit2 type (`PermitSingle`, `PermitBatch`, `PermitTransferFrom`, `PermitBatchTransferFrom`, `PermitWitnessTransferFrom`, `PermitBatchWitnessTransferFrom`). The domain is checked (Permit2 types must use the canonical Permit2 contract; EIP-2612 permits must name the token), and the types must define the primary type. Unknown Permit2 or permit-like types follow `onCheckError`; other typed data that names a `spender` is still screened;
   - `cast send ... "approve(address,uint256)" <spender>`.
 - **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The Wallet Risk Card is fetched once per spender, but every approval is judged on its own (amount, unlimited, token, revoke status): a positive grant never inherits the softer treatment of a zero-amount operation next to it. The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
 - Approval content that cannot be fully decoded (truncated calldata, tightly packed batches such as Safe `multiSend`, unparsed `cast` commands, very deep or very large batches), or whose explicit fields disagree with the call arguments or calldata, is never treated as screened: it follows `onCheckError` (ask by default).
@@ -93,6 +94,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.7**: Permit2 witness transfers screened; EIP-712 domain and type definitions validated; unknown permit-like typed data follows `onCheckError`. MoneyTools responses validated and reduced to allowlisted fields before use.
 - **0.1.6**: AgentCash never pays automatically (key-wallet autoPay unchanged); an AgentCash-paid check needs a per-call user confirmation. Risk is looked up once per spender, but every approval is judged separately.
 - **0.1.5**: one chain-id normalizer (hex, decimal, CAIP-2); unsupported or conflicting chain ids follow `onCheckError`; raw EIP-2612, DAI and Permit2 `permit` calldata is decoded and screened.
 - **0.1.4**: `approve(spender, 0)` is screened (may be ERC-721 token #0); JSON-string typed data and `eth_signTypedData_v4` requests are parsed and screened; unreadable signing payloads follow `onCheckError`.

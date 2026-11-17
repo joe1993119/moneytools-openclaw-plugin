@@ -23,7 +23,8 @@ const SELECTORS = {
 };
 const spenderIdx = (hex, sel) => (typeof sel.spenderArg === "function" ? sel.spenderArg(hex) : sel.spenderArg);
 const APPROVE_FN = /^(approve|increaseallowance|setapprovalforall|permit|permit2[._]?approve)$/i;
-const PERMIT_TYPES = /^(permit|permitsingle|permitbatch|permittransferfrom|permitbatchtransferfrom)$/i;
+const PERMIT2_TYPES = /^(permitsingle|permitbatch|permittransferfrom|permitbatchtransferfrom|permitwitnesstransferfrom|permitbatchwitnesstransferfrom)$/i;
+const PERMIT2_ADDRESS = "0x000000000022d473030f116ddee9f6b43ac78ba3"; // canonical Permit2 (same address on every supported chain)
 const MAX_UINT256 = (1n << 256n) - 1n;
 const ADDR = /^0x[0-9a-fA-F]{40}$/;
 
@@ -121,7 +122,8 @@ const typedChain = (id) => { const n = normalizeChain(id); return n ? n.chain ||
 function signingAdapter(v, problems) {
   const m = v.method ?? v.rpcMethod; if (typeof m !== "string" || !SIGN_TYPED.test(m)) return;
   const ps = Array.isArray(v.params) ? v.params : isObj(v.params) ? [v.params] : [];
-  const ok = ps.some((p) => isObj(p) ? typeof p.primaryType === "string" : typeof p === "string" && (() => { try { return typeof JSON.parse(p)?.primaryType === "string"; } catch { return false; } })());
+  const readable = (t) => isObj(t) && typeof t.primaryType === "string" && isObj(t.domain) && isObj(t.message) && isObj(t.types);
+  const ok = ps.some((p) => readable(p) || (typeof p === "string" && p.length <= MAX_JSON && (() => { try { return readable(JSON.parse(p)); } catch { return false; } })()));
   if (!ok) problems.push(`${m} request without readable typed data`);
 }
 const fnName = (fn) => String(fn).replace(/\(.*$/, "").trim();
@@ -177,13 +179,35 @@ function structuredApproval(v, chain, problems) {
   return op;
 }
 
+/** EIP-712 permits: EIP-2612 / DAI Permit and every Permit2 type (allowance, transfer, witness transfer; single and batch).
+ *  The domain (verifying contract, chain) and type definitions are checked; unknown permit-like types are reported, never ignored. */
 function typedDataApprovals(v, chain, problems) {
-  if (typeof v.primaryType !== "string" || !PERMIT_TYPES.test(v.primaryType)) return [];
-  const ch = typedChain(v.domain?.chainId) || chain;
-  const m = v.message; if (!isObj(m)) { problems.push(`${v.primaryType} signature without a message`); return []; }
+  if (typeof v.primaryType !== "string") return [];
+  const pt = v.primaryType; const d = isObj(v.domain) ? v.domain : null; const m = isObj(v.message) ? v.message : null;
+  const vc = typeof d?.verifyingContract === "string" ? d.verifyingContract.toLowerCase() : null;
+  const isP2 = PERMIT2_TYPES.test(pt) || vc === PERMIT2_ADDRESS || /^permit2$/i.test(String(d?.name ?? ""));
+  const known = PERMIT2_TYPES.test(pt) || /^permit$/i.test(pt);
+  if (!known) {
+    if (isP2) { problems.push(`unsupported Permit2 typed data ${pt}`); return []; }
+    if (/permit|approv|allowance|delegat/i.test(pt)) { problems.push(`unsupported authorization typed data ${pt}`); return []; }
+    if (m && isAddr(m.spender) && BigInt(m.spender) !== 0n) return [{ fn: `sign:${pt}`, spender: m.spender, chain: typedChain(d?.chainId) || chain, unlimited: false, via: "typed-data", ...(vc && isAddr(vc) ? { token: d.verifyingContract } : {}) }];
+    return [];
+  }
+  if (!m) { problems.push(`${pt} signature without a message`); return []; }
+  if (!d) { problems.push(`${pt} signature without a domain`); return []; }
+  if (!isObj(v.types) || !Array.isArray(v.types[pt])) problems.push(`${pt} signature whose types do not define ${pt}`);
+  if (isP2 && vc !== PERMIT2_ADDRESS) problems.push(`${pt} signature for verifying contract ${d.verifyingContract ?? "(none)"}, not the canonical Permit2`);
+  if (!isP2 && !(vc && isAddr(vc))) problems.push(`${pt} signature without a token verifying contract`);
   const spender = m.spender ?? m.details?.spender;
-  if (!isAddr(spender)) { problems.push(`${v.primaryType} signature without a decodable spender`); return []; }
-  return [{ fn: `sign:${v.primaryType}`, spender, chain: ch, unlimited: false, via: "typed-data" }];
+  if (!isAddr(spender)) { problems.push(`${pt} signature without a decodable spender`); return []; }
+  if (BigInt(spender) === 0n) return [];
+  if (/^permit$/i.test(pt) && "allowed" in m && (m.allowed === false || m.allowed === "false" || m.allowed === 0)) return []; // DAI permit revoke
+  const permitted = m.permitted ?? m.details; const first = Array.isArray(permitted) ? permitted[0] : permitted;
+  const token = isP2 ? (isAddr(first?.token) ? first.token : null) : d.verifyingContract;
+  const amount = Array.isArray(permitted) ? undefined : (first?.amount ?? m.value);
+  const op = { fn: `sign:${pt}`, spender, chain: typedChain(d.chainId) || chain, unlimited: amount !== undefined && isUnlimited(amount, isP2 ? 160 : 256), via: "typed-data" };
+  if (token) op.token = token; if (Array.isArray(permitted)) op.tokens = permitted.length; if (amount !== undefined && amount !== null) op.amount = String(amount);
+  return [op];
 }
 
 /** Every token approval this tool call would grant or sign (txs, nested/batched txs, Permit signatures, cast send),
