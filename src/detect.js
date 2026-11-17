@@ -69,7 +69,7 @@ function decodeCalldata(data) {
   const sw = word(data, sel.spenderArg); if (!sw) return null;
   const spender = "0x" + sw.slice(24);
   if (sel.boolArg !== undefined) { const b = word(data, sel.boolArg); if (!b || BigInt("0x" + b) === 0n) return null; return { fn: sel.fn, spender, unlimited: true }; }
-  const aw = word(data, sel.amountArg); const amount = aw ? BigInt("0x" + aw) : null;
+  const aw = word(data, sel.amountArg); if (!aw) return null; const amount = BigInt("0x" + aw); // truncated calldata is undecodable
   if (sel.fn === "approve" && amount === 0n) return null; // approve(spender, 0) is a revoke
   const unlimited = amount !== null && (sel.fn === "permit2.approve" ? amount >= (1n << 160n) - 1n : amount >= MAX_UINT256 / 2n);
   return { fn: sel.fn, spender, amount: amount === null ? null : amount.toString(), unlimited };
@@ -79,28 +79,104 @@ function chainOf(params, fallback) {
   return fallback;
 }
 
-/** Is this tool call about to grant a token approval (tx or Permit signature)? -> { spender, chain, fn, unlimited, via } | null */
-export function detectApproval(toolName, params, opts = {}) {
-  const name = String(toolName || ""); if (/^moneytools_/i.test(name)) return null;
-  const chain = chainOf(params, opts.defaultChain || "base");
-  for (const [, v] of walk(params)) { const d = decodeCalldata(v); if (d && ADDR.test(d.spender)) return { ...d, chain, via: "calldata" }; }
-  for (const [, v] of walk(params)) {
-    if (!isObj(v)) continue;
-    const fn = v.functionName ?? v.function ?? v.method ?? v.action;
-    if (typeof fn === "string" && APPROVE_FN.test(fn.replace(/\(.*$/, ""))) {
-      const args = Array.isArray(v.args) ? v.args : Array.isArray(v.arguments) ? v.arguments : [];
-      const spender = [v.spender, v.operator, args[0]].find((x) => typeof x === "string" && ADDR.test(x));
-      if (spender) { const amt = v.amount ?? v.value ?? args[1]; return { fn: fn.replace(/\(.*$/, ""), spender, chain, unlimited: amt === true || /^(max|unlimited|infinite)$/i.test(String(amt)) || (/^\d+$/.test(String(amt)) && BigInt(String(amt)) >= MAX_UINT256 / 2n), via: "structured" }; }
-    }
-    if (typeof v.primaryType === "string" && PERMIT_TYPES.test(v.primaryType) && isObj(v.message)) {
-      const spender = [v.message.spender, v.message?.details?.spender].find((x) => typeof x === "string" && ADDR.test(x));
-      if (spender) return { fn: `sign:${v.primaryType}`, spender, chain: CHAINS[String(v.domain?.chainId ?? "").toLowerCase()] || chain, unlimited: false, via: "typed-data" };
+const PERMIT2_ONE = /^permit2[._]?approve$/i;
+const MAX_OPS = 20, MAX_DEPTH = 12, MAX_ITEMS = 200;
+const fnName = (fn) => String(fn).replace(/\(.*$/, "").trim();
+const isAddr = (x) => typeof x === "string" && ADDR.test(x);
+const isUnlimited = (amt, bits = 256) => amt === true || /^(max|unlimited|infinite)$/i.test(String(amt)) || (/^\d+$/.test(String(amt)) && BigInt(String(amt)) >= (bits === 160 ? (1n << 160n) - 1n : MAX_UINT256 / 2n));
+const chainFrom = (v) => { if (!isObj(v)) return null; for (const k of Object.keys(v)) if (/^(chain|chainid|chain_id|network|chainname)$/i.test(k) && (typeof v[k] === "string" || typeof v[k] === "number")) { const c = CHAINS[String(v[k]).toLowerCase()]; if (c) return c; } return null; };
+
+/** Approval selectors embedded in batch calldata (multicall, multiSend, execute ...): word-aligned ones are decoded, anything else is reported as undecodable. */
+function embeddedApprovals(hex, ops, problems, chain) {
+  const body = hex.slice(10).toLowerCase();
+  for (const sel of Object.keys(SELECTORS)) {
+    const s = sel.slice(2); let at = body.indexOf(s);
+    while (at !== -1) {
+      const d = at % 64 === 0 ? decodeCalldata("0x" + body.slice(at)) : null;
+      if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata:batch" });
+      else if (at % 64 === 0 && isRevoke("0x" + body.slice(at), SELECTORS[sel])) { /* aligned revoke (amount 0 / false): nothing to screen */ }
+      else problems.push(`batched calldata contains a ${SELECTORS[sel].fn} call that could not be decoded`);
+      at = body.indexOf(s, at + 8);
     }
   }
-  if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
-    const cmd = commandOf(params);
-    const m = /\bcast\s+send\b[^\n]*?["']?(approve|increaseAllowance|setApprovalForAll)\s*\([^)]*\)["']?\s+(0x[0-9a-fA-F]{40})/i.exec(cmd);
-    if (m) { const ch = /--chain(?:-id)?\s+(\S+)/.exec(cmd)?.[1]; return { fn: m[1], spender: m[2], chain: (ch && CHAINS[ch.toLowerCase()]) || chain, unlimited: /max|uint256\.max|115792089237316195423570985008687907853269984665640564039457584007913129639935/i.test(cmd), via: "exec:cast" }; }
-  }
-  return null;
 }
+
+/** Structured call ({ functionName, args } and similar), decoded by its real ABI. */
+function structuredApproval(v, chain, problems) {
+  const raw = v.functionName ?? v.function ?? v.method ?? v.action;
+  if (typeof raw !== "string" || !APPROVE_FN.test(fnName(raw))) return null;
+  const name = fnName(raw); const sig = /\(([^)]*)\)/.exec(String(raw))?.[1]?.replace(/\s+/g, "") ?? null;
+  const args = Array.isArray(v.args) ? v.args : Array.isArray(v.arguments) ? v.arguments : [];
+  const lname = name.toLowerCase();
+  let fn = name, spender, amount, unlimited, expiration;
+  const permit2 = PERMIT2_ONE.test(name) || (lname === "approve" && (sig === "address,address,uint160,uint48" || args.length === 4));
+  if (permit2) { fn = "permit2.approve"; spender = args[1] ?? v.spender; amount = args[2] ?? v.amount; expiration = args[3] ?? v.expiration; unlimited = isUnlimited(amount, 160); }
+  else if (lname === "approve" || lname === "increaseallowance") {
+    if (sig && sig !== "address,uint256") { problems.push(`unsupported ${name}(${sig}) signature`); return null; }
+    spender = args.length ? args[0] : v.spender; amount = args.length ? args[1] : (v.amount ?? v.value); unlimited = isUnlimited(amount);
+    if (lname === "approve" && /^0+$/.test(String(amount))) return null; // revoke
+  } else if (lname === "setapprovalforall") {
+    spender = args.length ? args[0] : v.operator; const on = args.length ? args[1] : v.approved;
+    if (on === false || on === "false" || on === 0 || on === "0") return null; unlimited = true;
+  } else if (lname === "permit") { // EIP-2612 permit(owner, spender, value, deadline, v, r, s)
+    spender = args.length ? args[1] : v.spender; amount = args.length ? args[2] : v.value; unlimited = isUnlimited(amount);
+  } else { problems.push(`unsupported approval call ${name}`); return null; }
+  // Explicit fields must agree with the arguments that will execute.
+  for (const k of ["spender", "operator"]) if (isAddr(v[k]) && isAddr(spender) && v[k].toLowerCase() !== spender.toLowerCase()) { problems.push(`${name}: ${k} field ${v[k]} disagrees with the call arguments (${spender})`); return null; }
+  if (!isAddr(spender)) { problems.push(`${name} call without a decodable spender`); return null; }
+  const op = { fn, spender, chain: chainFrom(v) || chain, unlimited: !!unlimited, via: "structured" };
+  if (amount !== undefined) op.amount = String(amount); if (expiration !== undefined) op.expiration = String(expiration);
+  return op;
+}
+
+function typedDataApprovals(v, chain, problems) {
+  if (typeof v.primaryType !== "string" || !PERMIT_TYPES.test(v.primaryType)) return [];
+  const ch = CHAINS[String(v.domain?.chainId ?? "").toLowerCase()] || chain;
+  const m = v.message; if (!isObj(m)) { problems.push(`${v.primaryType} signature without a message`); return []; }
+  const spender = m.spender ?? m.details?.spender;
+  if (!isAddr(spender)) { problems.push(`${v.primaryType} signature without a decodable spender`); return []; }
+  return [{ fn: `sign:${v.primaryType}`, spender, chain: ch, unlimited: false, via: "typed-data" }];
+}
+
+/** Every token approval this tool call would grant or sign (txs, nested/batched txs, Permit signatures, cast send),
+ *  plus problems: approval-like content that could not be decoded or whose representations disagree. -> { approvals, problems } */
+export function detectApprovals(toolName, params, opts = {}) {
+  const name = String(toolName || ""); const approvals = [], problems = [];
+  if (/^moneytools_/i.test(name)) return { approvals, problems };
+  const ops = [];
+  const visit = (v, chain, depth) => {
+    if (depth > MAX_DEPTH) { if (v && typeof v === "object") problems.push("transaction data nested too deeply to screen"); return; }
+    if (typeof v === "string") {
+      if (!/^0x[0-9a-fA-F]{8}/.test(v) || v.length === 42 || v.length === 66) return; // addresses and hashes are not calldata
+      const sel = SELECTORS[v.slice(0, 10).toLowerCase()];
+      if (sel) { const d = decodeCalldata(v); if (d && isAddr(d.spender)) ops.push({ ...d, chain, via: "calldata" }); else if (!d && !isRevoke(v, sel)) problems.push(`${sel.fn} calldata could not be decoded`); }
+      else if (v.length > 10 + 128) embeddedApprovals(v, ops, problems, chain);
+      return;
+    }
+    if (Array.isArray(v)) { if (v.length > MAX_ITEMS) problems.push("transaction batch too large to screen"); for (const x of v.slice(0, MAX_ITEMS)) visit(x, chain, depth + 1); return; }
+    if (!isObj(v)) return;
+    const ch = chainFrom(v) || chain; const keys = Object.keys(v);
+    if (keys.length > MAX_ITEMS) problems.push("transaction object too large to screen");
+    const st = structuredApproval(v, ch, problems); if (st) ops.push(st);
+    ops.push(...typedDataApprovals(v, ch, problems));
+    // calldata in the same object must agree with the structured call
+    if (st && typeof v.data === "string") { const d = decodeCalldata(v.data); if (d && d.spender.toLowerCase() !== st.spender.toLowerCase()) problems.push(`structured ${st.fn} spender ${st.spender} disagrees with calldata spender ${d.spender}`); }
+    for (const k of keys.slice(0, MAX_ITEMS)) visit(v[k], ch, depth + 1);
+  };
+  visit(params, chainOf(params, opts.defaultChain || "base"), 0);
+  if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
+    const cmd = commandOf(params); const chain = chainOf(params, opts.defaultChain || "base");
+    const re = /\bcast\s+send\b[^\n]*?["']?(approve|increaseAllowance|setApprovalForAll)\s*\([^)]*\)["']?\s+(0x[0-9a-fA-F]{40})/gi; let m, found = 0;
+    while ((m = re.exec(cmd))) { found++; const ch = /--chain(?:-id)?\s+(\S+)/.exec(cmd.slice(m.index))?.[1]; ops.push({ fn: m[1], spender: m[2], chain: (ch && CHAINS[ch.toLowerCase()]) || chain, unlimited: /max|uint256\.max|115792089237316195423570985008687907853269984665640564039457584007913129639935/i.test(cmd), via: "exec:cast" }); }
+    const mentions = (cmd.match(/\b(approve|increaseAllowance|setApprovalForAll|permit)\s*\(/gi) || []).length;
+    if (/\b(cast\s+send|cast\s+calldata|seth\s+send)\b/i.test(cmd) && mentions > found) problems.push("command contains an approval call that could not be parsed");
+  }
+  const seen = new Set();
+  for (const o of ops) { const k = `${o.chain}:${o.spender.toLowerCase()}:${o.fn}`; if (!seen.has(k)) { seen.add(k); approvals.push(o); } }
+  if (approvals.length > MAX_OPS) { problems.push(`${approvals.length} approvals in one call; only the first ${MAX_OPS} are screened`); approvals.length = MAX_OPS; }
+  return { approvals, problems: [...new Set(problems)] };
+}
+function isRevoke(hex, sel) { const w = word(hex, sel.amountArg ?? sel.boolArg); return w !== null && BigInt("0x" + w) === 0n && word(hex, sel.spenderArg) !== null; }
+
+/** First approval only (kept for compatibility; the guard uses detectApprovals). */
+export function detectApproval(toolName, params, opts = {}) { return detectApprovals(toolName, params, opts).approvals[0] || null; }

@@ -144,3 +144,38 @@ test("finding 3: user info, query string and fragment never leave the agent", as
 });
 import { toolDefs } from "../src/guard.js";
 const toolDefsFor = (g) => toolDefs(g, { Object: (p) => p, String: (o) => o, Optional: (s) => s })[0];
+
+// --- 0.1.3: strict combine over every approval in a call ---
+import { combineDecisions } from "../src/guard.js";
+const BADSP = "0x000000000000000000000000000000000000dead";
+const appr = (sp) => "0x095ea7b3" + sp.slice(2).padStart(64, "0") + "f".repeat(64);
+const riskFetch = (levels) => async (url) => { const sp = /address=([^&]+)/.exec(url)[1].toLowerCase(); return res200(levels[sp] || { level: "low" }); };
+test("batch with one benign and one malicious approval is blocked in either order", async () => {
+  for (const calls of [[{ data: appr(SP) }, { data: appr(BADSP) }], [{ data: appr(BADSP) }, { data: appr(SP) }]]) {
+    const seen = []; const f = riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } });
+    const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async (u) => { seen.push(u); return f(u); } });
+    const d = await g.beforeToolCall({ toolName: "wallet_sendCalls", params: { calls, chainId: 8453 } });
+    assert.equal(d.block, true); assert.match(d.blockReason, /dead/); assert.equal(seen.length, 2, "both spenders screened");
+  }
+});
+test("strict combine: block > ask > allow; asks are merged with the highest severity", () => {
+  const ask = (t, s) => ({ requireApproval: { title: t, description: t, severity: s } });
+  assert.equal(combineDecisions([undefined, ask("a", "warning"), { block: true, blockReason: "x" }]).block, true);
+  const m = combineDecisions([ask("a", "warning"), undefined, ask("b", "critical")]); assert.equal(m.requireApproval.severity, "critical"); assert.match(m.requireApproval.description, /a[\s\S]*b/);
+  assert.equal(combineDecisions([undefined, undefined]), undefined);
+});
+test("undecodable or conflicting approval content goes to onCheckError (ask by default, block when configured)", async () => {
+  const params = { functionName: "approve", spender: SP, args: [BADSP, "1"] };
+  const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({}) });
+  assert.match((await g.beforeToolCall({ toolName: "wallet_call", params })).requireApproval.description, /disagrees/);
+  const gb = createGuard({ onCheckError: "block" }, { env: {}, fileExists: () => false, fetch: riskFetch({}) });
+  assert.equal((await gb.beforeToolCall({ toolName: "send_transaction", params: { data: "0x095ea7b3" + SP.slice(2).padStart(64, "0") } })).block, true);
+  // one clean low-risk approval plus one undecodable one: still not silently allowed
+  const d = await g.beforeToolCall({ toolName: "wallet_sendCalls", params: { calls: [{ data: appr(SP) }, { functionName: "approve", args: ["nope", "1"] }] } });
+  assert.ok(d?.requireApproval);
+});
+test("structured Permit2 approve screens the real spender (args[1]), not the token", async () => {
+  const seen = []; const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async (u) => { seen.push(u); return res200({ level: "low" }); } });
+  await g.beforeToolCall({ toolName: "wallet_call", params: { functionName: "approve", args: ["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", BADSP, "10", "1800000000"] } });
+  assert.equal(seen.length, 1); assert.match(seen[0], /address=0x000000000000000000000000000000000000dead/);
+});

@@ -57,9 +57,11 @@ The plugin uses OpenClaw's `before_tool_call` hook.
   - an `exec` command running `agentcash fetch <url>` or sending a payment header.
 - **Approval**:
   - calldata with the `approve`, `increaseAllowance`, `setApprovalForAll(true)` or Permit2 `approve` selector;
-  - structured `{ functionName: "approve", args: [spender, ...] }` calls;
+  - structured calls decoded by their ABI: `approve` / `increaseAllowance(spender, amount)`, `setApprovalForAll(operator, true)`, EIP-2612 `permit` (spender = `args[1]`), Permit2 `approve(token, spender, amount, expiration)` (spender = `args[1]`);
   - EIP-712 `Permit` / `PermitSingle` / `PermitBatch` signatures;
   - `cast send ... "approve(address,uint256)" <spender>`.
+- **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
+- Approval content that cannot be fully decoded (truncated calldata, tightly packed batches such as Safe `multiSend`, unparsed `cast` commands, very deep or very large batches), or whose explicit fields disagree with the call arguments or calldata, is never treated as screened: it follows `onCheckError` (ask by default).
 - `approve(spender, 0)` is a revoke and is not checked. MoneyTools' own check URLs are never checked, so the plugin cannot loop.
 
 ## Tools for the agent
@@ -86,6 +88,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.3**: every approval in a call is screened (nested and batched), strict combine of results, Permit2 `approve` decoded by its ABI, undecodable or conflicting approval content follows `onCheckError`.
 - **0.1.2**: signed payments are checked against the verified quote before sending; atomic daily-budget reservation; user info, query and fragment stripped from checked URLs.
 - **0.1.1**: paid checks opt-in (`autoPay` default false), 0.25 USDC/day cap.
 

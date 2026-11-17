@@ -1,5 +1,5 @@
 // Host-free plugin logic: config, decisions, the before_tool_call handler and the two explicit tools.
-import { detectX402Payment, detectApproval, DEFAULT_PAYMENT_TOOL_PATTERN, CHAINS } from "./detect.js";
+import { detectX402Payment, detectApprovals, DEFAULT_PAYMENT_TOOL_PATTERN, CHAINS } from "./detect.js";
 import { callCheck, resolvePayer, makeBudget, precheckUrl, walletRiskUrl, sanitizeTargetUrl, PRICES, CheckError } from "./checks.js";
 
 export const PLUGIN_ID = "moneytools-guard";
@@ -14,7 +14,7 @@ export function readConfig(raw = {}) {
 }
 
 const fmtUsd = (x) => `${Number(x).toFixed(3).replace(/0+$/, "").replace(/\.$/, "")} USDC`;
-function approval(title, description, severity = "warning") { return { requireApproval: { title, description: description.slice(0, 900), severity, timeoutMs: 120000, allowedDecisions: ["allow-once", "deny"] } }; }
+function approval(title, description, severity = "warning") { return { requireApproval: { title, description: description.slice(0, 1500), severity, timeoutMs: 120000, allowedDecisions: ["allow-once", "deny"] } }; }
 function onError(cfg, what, e) {
   const msg = `MoneyTools ${what} did not run: ${e.message}`;
   if (cfg.onCheckError === "allow") return undefined;
@@ -41,6 +41,17 @@ export function decideRisk(cfg, a, card) {
   return undefined;
 }
 
+const SEV = { info: 0, warning: 1, critical: 2 };
+/** Strict combine: any block blocks the whole call; otherwise any approval request asks once with every reason; allow only when every part allowed. */
+export function combineDecisions(decisions) {
+  const ds = decisions.filter(Boolean);
+  const blocks = ds.filter((d) => d.block); if (blocks.length) return { block: true, blockReason: blocks.map((d) => d.blockReason).join(" | ").slice(0, 1500) };
+  const asks = ds.filter((d) => d.requireApproval); if (!asks.length) return undefined;
+  if (asks.length === 1) return asks[0];
+  const sev = asks.map((d) => d.requireApproval.severity).reduce((a, b) => (SEV[b] > SEV[a] ? b : a), "info");
+  return approval(`${asks.length} checks need your OK`, asks.map((d, i) => `${i + 1}. ${d.requireApproval.title}: ${d.requireApproval.description}`).join("\n"), sev);
+}
+
 export function createGuard(rawCfg, deps = {}) {
   const cfg = readConfig(rawCfg); const env = deps.env || process.env; const log = deps.logger || { info() {}, warn() {} };
   const budget = makeBudget(cfg.dailyBudgetUsd, deps.now); const cache = new Map(); const ttl = cfg.cacheMinutes * 60000; const now = deps.now || (() => Date.now());
@@ -59,13 +70,20 @@ export function createGuard(rawCfg, deps = {}) {
 
   async function beforeToolCall(event, ctx = {}) {
     const name = event?.toolName || ctx.toolName; const params = event?.params || {}; const opts = { paymentToolPattern: cfg.pattern, defaultChain: cfg.defaultChain, toolKind: event?.toolKind || ctx.toolKind };
-    if (cfg.checkApprovals) { const a = detectApproval(name, params, opts);
-      if (a) { try { const { data, paidUsd } = await walletRisk(a.spender, a.chain); log.info?.(`[${PLUGIN_ID}] wallet-risk ${a.spender} ${a.chain}: ${data?.level} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decideRisk(cfg, a, data); }
-        catch (e) { return onError(cfg, "Wallet Risk Card", e); } } }
+    const parts = [];
+    if (cfg.checkApprovals) {
+      const { approvals, problems } = detectApprovals(name, params, opts);
+      // Every approval in the call is screened (in parallel; the budget reservation keeps spend under the cap).
+      parts.push(...await Promise.all(approvals.map(async (a) => {
+        try { const { data, paidUsd } = await walletRisk(a.spender, a.chain); log.info?.(`[${PLUGIN_ID}] wallet-risk ${a.spender} ${a.chain}: ${data?.level} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decideRisk(cfg, a, data); }
+        catch (e) { return onError(cfg, `Wallet Risk Card for ${a.spender}`, e); } })));
+      // Approval content that could not be decoded, or whose fields disagree, is never treated as screened.
+      for (const p of problems) parts.push(onError(cfg, "approval screening", new Error(p)));
+    }
     if (cfg.precheckPayments) { const p = detectX402Payment(name, params, opts);
-      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${sanitizeTargetUrl(p.url)}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decidePrecheck(cfg, p.url, data); }
-        catch (e) { return onError(cfg, "pay precheck", e); } } }
-    return undefined;
+      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${sanitizeTargetUrl(p.url)}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); parts.push(decidePrecheck(cfg, p.url, data)); }
+        catch (e) { parts.push(onError(cfg, "pay precheck", e)); } } }
+    return combineDecisions(parts);
   }
   return { cfg, budget, beforeToolCall, precheck, walletRisk, payer };
 }

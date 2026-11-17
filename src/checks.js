@@ -15,7 +15,7 @@ export const USDC_BASE = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
 export const BASE = "eip155:8453";
 export const PRICES = { precheck: 0.005, walletRisk: 0.02 };
 export const AGENTCASH_VERSION = "0.17.1"; // pinned; never @latest
-const UA = "moneytools-openclaw-plugin/0.1.2";
+const UA = "moneytools-openclaw-plugin/0.1.3";
 
 export class CheckError extends Error { constructor(code, message) { super(message); this.code = code; } }
 

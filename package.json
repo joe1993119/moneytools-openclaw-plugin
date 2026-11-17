@@ -1,6 +1,6 @@
 {
   "name": "@moneytools-dev/openclaw-plugin",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "OpenClaw plugin: MoneyTools pay precheck before every x402 payment and a Wallet Risk Card before every token approval. Pays from the agent's own wallet; failed checks are not charged.",
   "type": "module",
   "main": "./index.js",
