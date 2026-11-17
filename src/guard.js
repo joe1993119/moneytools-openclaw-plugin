@@ -101,7 +101,9 @@ export function createGuard(rawCfg, deps = {}) {
       for (const p of problems) parts.push(onError(cfg, "approval screening", new Error(p)));
     }
     if (cfg.precheckPayments) { const p = detectX402Payment(name, params, opts);
-      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${sanitizeTargetUrl(p.url)}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); parts.push(decidePrecheck(cfg, p.url, data)); }
+      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${sanitizeTargetUrl(p.url)}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); parts.push(decidePrecheck(cfg, p.url, data));
+          // The query string is never sent to MoneyTools, so its payment terms were not screened: follow onCheckError (ask by default).
+          if (p.hasQuery) parts.push(onError(cfg, "pay precheck for the query string", new CheckError("query_not_checked", `the precheck covered only the base path ${p.url}; the query string was not sent to MoneyTools, so payment terms that depend on it were not screened`))); }
         catch (e) { parts.push(onError(cfg, "pay precheck", e)); } } }
     return combineDecisions(parts);
   }
@@ -118,7 +120,9 @@ export function toolDefs(guard, Type) {
   return [
     { name: "moneytools_pay_precheck", description: `Check an x402 seller URL before paying: validates its 402 terms (network, amount, asset, payTo) and screens payTo against the OFAC SDN list. Free daily tier, then ${PRICES.precheck} USDC on Base, paid from your own wallet (AgentCash only with payWithAgentcash and your confirmation). Failed checks are not charged.`,
       parameters: Type.Object({ url: Type.String({ description: "x402 endpoint you plan to pay" }), method: Type.Optional(Type.String({ description: "HTTP method of the paid call (default GET)" })), payWithAgentcash: AC(Type) }),
-      async execute(_id, p) { try { const ac = confirmed("moneytools_pay_precheck", p, _id); const r = await guard.precheck(p.url, (p.method || "GET").toUpperCase(), { agentcashConfirmed: ac }); return text({ ...r.data, paidUsd: r.paidUsd, note: NOTE }); } catch (e) { return errOut(e); } } },
+      async execute(_id, p) { try { const ac = confirmed("moneytools_pay_precheck", p, _id); const r = await guard.precheck(p.url, (p.method || "GET").toUpperCase(), { agentcashConfirmed: ac });
+        const q = (() => { try { return new URL(String(p.url).trim()).search.length > 1; } catch { return false; } })();
+        return text({ ...r.data, paidUsd: r.paidUsd, coverage: q ? "base path only: the query string was not sent or checked; payment terms that depend on it were not screened" : "full path", note: NOTE }); } catch (e) { return errOut(e); } } },
     { name: "moneytools_wallet_risk", description: `Wallet Risk Card for an EVM address or ENS name before you pay, trust or approve it: 0-100 risk score, grade A-F, OFAC SDN match, address checks, open approvals. ${PRICES.walletRisk} USDC on Base, paid from your own wallet (AgentCash only with payWithAgentcash and your confirmation). Failed checks are not charged.`,
       parameters: Type.Object({ address: Type.String({ description: "0x address or ENS name" }), chain: Type.Optional(Type.String({ description: `one of ${[...new Set(Object.values(CHAINS))].join(", ")} (default base)` })), payWithAgentcash: AC(Type) }),
       async execute(_id, p) { try { const ac = confirmed("moneytools_wallet_risk", p, _id); const r = await guard.walletRisk(p.address, CHAINS[String(p.chain || "base").toLowerCase()] || "base", { agentcashConfirmed: ac }); return text({ ...r.data, paidUsd: r.paidUsd, note: NOTE }); } catch (e) { return errOut(e); } } },

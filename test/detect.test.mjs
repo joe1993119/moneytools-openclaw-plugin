@@ -5,7 +5,7 @@ const pad = (h) => h.replace(/^0x/, "").padStart(64, "0");
 const approveData = (spender, amt) => "0x095ea7b3" + pad(spender) + pad(amt.toString(16));
 
 test("x402: agentcash / x402 tool names with a URL are payments; plain web fetch is not", () => {
-  assert.deepEqual(detectX402Payment("agentcash__fetch", { url: "https://seller.example/api" }), { url: "https://seller.example/api", method: "GET", via: "tool-name" });
+  assert.deepEqual(detectX402Payment("agentcash__fetch", { url: "https://seller.example/api" }), { url: "https://seller.example/api", method: "GET", via: "tool-name", hasQuery: false });
   assert.equal(detectX402Payment("x402_pay", { endpoint: "https://s.example/x", method: "post" }).method, "POST");
   assert.equal(detectX402Payment("web_fetch", { url: "https://news.example/" }), null);
   assert.equal(detectX402Payment("web_fetch", { url: "https://s.example/p", headers: { "PAYMENT-SIGNATURE": "abc" } }).via, "payment-header");
@@ -178,4 +178,11 @@ test("DAI revoke only when the signed type is DAI's Permit with `allowed: bool`;
   // near-DAI schemas (allowed not bool, reordered, extra field) are not treated as revokes
   for (const f of [DAI.map((x) => (x.name === "allowed" ? { name: "allowed", type: "uint256" } : x)), [DAI[1], DAI[0], ...DAI.slice(2)], [...DAI, { name: "value", type: "uint256" }]])
     assert.equal(detectApprovals("sign_typed_data", { typedData: td(f, { holder: SP, spender: BAD, nonce: 0, expiry: 0, allowed: false, value: "5" }) }).approvals.length, 1);
+});
+
+test("x402: a payment URL with a query string is flagged; the returned URL stays stripped", () => {
+  const a = detectX402Payment("x402_fetch", { url: "https://s.example/p?tier=pro&key=SECRET" }); assert.equal(a.url, "https://s.example/p"); assert.equal(a.hasQuery, true);
+  assert.equal(detectX402Payment("exec", { command: "npx agentcash fetch 'https://s.example/p?x=1'" }).hasQuery, true);
+  assert.equal(detectX402Payment("x402_fetch", { url: "https://s.example/p#frag" }).hasQuery, false);
+  assert.equal(detectX402Payment("x402_fetch", { url: "https://s.example/p?" }).hasQuery, false);
 });

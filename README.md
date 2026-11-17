@@ -34,7 +34,7 @@ The plugin is off until you enable it, and it spends nothing until you set `auto
 - **Signed-payment check**: with a key payer, the plugin signs only the single verified requirement, then checks the signed authorization (amount, USDC, Base, payTo, validity window) against the quote before sending it. One paid request, no automatic retry.
 - **Daily cap**: `dailyBudgetUsd` (default 0.25 USDC per UTC day, max 5). Spend is reserved before each payment starts, so parallel checks cannot exceed the cap; a payment that does not complete gives its reservation back. Identical checks running at the same time share one payment.
 - **What comes back**: MoneyTools responses are validated against a fixed schema per endpoint. Only typed fields reach decisions, logs and the agent: verdict, risk score, grade, level, sanctioned, and reason, warning and flag codes. Upstream free text (summaries, headlines, flag details, labels) is dropped, and short summaries are rebuilt locally from the codes. A malformed response follows `onCheckError`.
-- **What is sent**: only the scheme, host, port and path of the URL being checked. User info, query strings and fragments (API keys, signed links) are dropped before the precheck request and are not logged.
+- **What is sent**: only the scheme, host, port and path of the URL being checked. User info, query strings and fragments (API keys, signed links) are dropped before the precheck request and are not logged. Because the query string is not sent, a payment URL that has one is only prechecked on its base path: the plugin says so and follows `onCheckError` (ask by default), since payment terms that depend on the query were not screened. `moneytools_pay_precheck` reports this in its `coverage` field.
 - **Cache**: the same URL or spender is not checked again for `cacheMinutes` (default 10).
 - `autoPay` (default `false`): with `false` the plugin never pays; precheck uses its free daily tier, and a check that needs payment (always the Wallet Risk Card) goes to `onCheckError`, which asks you by default.
 
@@ -94,6 +94,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.9**: payment URLs with a query string follow `onCheckError` (ask by default) because the precheck only covers the base path; queries are still never sent.
 - **0.1.8**: a permit is treated as a DAI revoke only when its signed type declares `allowed` as a bool in DAI's Permit format; otherwise it is screened.
 - **0.1.7**: Permit2 witness transfers screened; EIP-712 domain and type definitions validated; unknown permit-like typed data follows `onCheckError`. MoneyTools responses validated and reduced to allowlisted fields before use.
 - **0.1.6**: AgentCash never pays automatically (key-wallet autoPay unchanged); an AgentCash-paid check needs a per-call user confirmation. Risk is looked up once per spender, but every approval is judged separately.

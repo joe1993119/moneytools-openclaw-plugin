@@ -42,11 +42,15 @@ const httpUrl = stripUrl;
 
 export function isOwnCheckUrl(url) { try { return /(^|\.)moneytools\.dev$/i.test(new URL(url).hostname); } catch { return false; } }
 
+/** Raw URL string as given (only used to tell whether it had a query string; the stripped form is what is returned and sent). */
 function findUrl(params) {
-  for (const k of URL_KEYS) { const u = httpUrl(params?.[k]); if (u) return u; }
+  for (const k of URL_KEYS) { if (httpUrl(params?.[k])) return params[k]; }
   for (const k of ["request", "input", "args", "arguments"]) if (isObj(params?.[k])) { const u = findUrl(params[k]); if (u) return u; }
   return null;
 }
+const hasQuery = (s) => { try { return new URL(String(s).trim()).search.length > 1; } catch { return false; } };
+// The precheck only sees scheme/host/path; a payment URL with a query string is flagged so the guard can say the query was not screened.
+const pay = (raw, method, via) => ({ url: stripUrl(raw), method, via, hasQuery: hasQuery(raw) });
 function hasPaymentHeader(params) {
   for (const [, v] of walk(params)) {
     if (isObj(v)) { for (const k of Object.keys(v)) if (PAY_HEADER.test(k)) return true; }
@@ -64,13 +68,13 @@ export function detectX402Payment(toolName, params, opts = {}) {
   if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
     const cmd = commandOf(params);
     const m = /\bagentcash(?:@[\w.\-]+)?\s+(?:fetch|fetch-auth)\s+["']?(https?:\/\/[^\s"']+)/i.exec(cmd);
-    if (m && !isOwnCheckUrl(m[1]) && stripUrl(m[1])) return { url: stripUrl(m[1]), method: /(?:-m|--method)\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:agentcash" };
-    if (/(payment-signature|x-payment)\s*:/i.test(cmd)) { const u = /(https?:\/\/[^\s"']+)/.exec(cmd)?.[1]; if (u && !isOwnCheckUrl(u) && stripUrl(u)) return { url: stripUrl(u), method: /-X\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:payment-header" }; }
+    if (m && !isOwnCheckUrl(m[1]) && stripUrl(m[1])) return pay(m[1], /(?:-m|--method)\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", "exec:agentcash");
+    if (/(payment-signature|x-payment)\s*:/i.test(cmd)) { const u = /(https?:\/\/[^\s"']+)/.exec(cmd)?.[1]; if (u && !isOwnCheckUrl(u) && stripUrl(u)) return pay(u, /-X\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", "exec:payment-header"); }
     return null;
   }
-  const url = findUrl(params); if (!url || isOwnCheckUrl(url)) return null;
-  if (hasPaymentHeader(params)) return { url, method, via: "payment-header" };
-  if (pattern.test(name)) return { url, method, via: "tool-name" };
+  const raw = findUrl(params); if (!raw || isOwnCheckUrl(raw)) return null;
+  if (hasPaymentHeader(params)) return pay(raw, method, "payment-header");
+  if (pattern.test(name)) return pay(raw, method, "tool-name");
   return null;
 }
 

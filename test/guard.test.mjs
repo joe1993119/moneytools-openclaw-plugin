@@ -278,3 +278,17 @@ test("EIP-2612 permit with an unsigned allowed:false to a high-risk spender is b
   const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } }) });
   assert.equal((await g.beforeToolCall({ toolName: "wallet_request", params: { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] } })).block, true);
 });
+
+test("a payment URL with a query string goes to onCheckError even when the base-path precheck is ok; the query is never sent", async () => {
+  const seen = []; const mk = (cfg) => createGuard(cfg, { env: {}, fileExists: () => false, fetch: async (u) => { seen.push(u); return res200({ verdict: "ok" }); } });
+  const d = await mk({}).beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p?tier=pro&key=SECRET" } });
+  assert.match(d.requireApproval.description, /covered only the base path https:\/\/s\.example\/p/); assert.ok(seen.every((u) => !/SECRET|tier/.test(u)));
+  assert.equal((await mk({ onCheckError: "block" }).beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p?a=1" } })).block, true);
+  assert.equal(await mk({ onCheckError: "allow" }).beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p?a=1" } }), undefined);
+  assert.equal(await mk({}).beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p" } }), undefined, "no query: ok passes");
+  // a block verdict still blocks
+  const gb = createGuard({}, { env: {}, fileExists: () => false, fetch: async () => res200({ verdict: "block", reasons: ["payTo_on_ofac_sdn_list"] }) });
+  assert.equal((await gb.beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p?a=1" } })).block, true);
+  // explicit tool reports the coverage
+  const out = await toolDefs(mk({}), T6)[0].execute("1", { url: "https://s.example/p?a=1" }); assert.match(out.details.coverage, /base path only/);
+});
