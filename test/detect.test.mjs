@@ -162,3 +162,20 @@ test("Permit2 witness transfers (single and batch, object and JSON string) are s
   // signing request whose payload lacks domain/types/message is unreadable
   assert.match(detectApprovals("wallet_request", { method: "eth_signTypedData_v4", params: [SP, JSON.stringify({ primaryType: "Permit" })] }).problems.join(), /without readable typed data/);
 });
+
+// --- 0.1.7 rescan: an unsigned `allowed` property never turns a permit into a revoke ---
+test("DAI revoke only when the signed type is DAI's Permit with `allowed: bool`; otherwise the permit is screened", () => {
+  const DAI = [{ name: "holder", type: "address" }, { name: "spender", type: "address" }, { name: "nonce", type: "uint256" }, { name: "expiry", type: "uint256" }, { name: "allowed", type: "bool" }];
+  const E2612 = [{ name: "owner", type: "address" }, { name: "spender", type: "address" }, { name: "value", type: "uint256" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" }];
+  const td = (fields, message) => ({ types: { EIP712Domain: [], Permit: fields }, primaryType: "Permit", domain: { name: "T", chainId: 1, verifyingContract: TOKEN }, message });
+  // EIP-2612 permit with an extra unsigned allowed:false -> screened (positive value)
+  const a = detectApprovals("sign_typed_data", { typedData: td(E2612, { owner: SP, spender: BAD, value: "1000", nonce: 0, deadline: 1, allowed: false }) });
+  assert.equal(a.approvals[0].spender, BAD); assert.equal(a.approvals[0].amount, "1000");
+  assert.equal(detectApprovals("sign_typed_data", { typedData: JSON.stringify(td(E2612, { owner: SP, spender: BAD, value: "1", nonce: 0, deadline: 1, allowed: "false" })) }).approvals.length, 1);
+  // real DAI permit: allowed false -> revoke; allowed true -> screened
+  const r = detectApprovals("sign_typed_data", { typedData: td(DAI, { holder: SP, spender: BAD, nonce: 0, expiry: 0, allowed: false }) }); assert.equal(r.approvals.length, 0); assert.deepEqual(r.problems, []);
+  assert.equal(detectApprovals("sign_typed_data", { typedData: td(DAI, { holder: SP, spender: BAD, nonce: 0, expiry: 0, allowed: true }) }).approvals[0].spender, BAD);
+  // near-DAI schemas (allowed not bool, reordered, extra field) are not treated as revokes
+  for (const f of [DAI.map((x) => (x.name === "allowed" ? { name: "allowed", type: "uint256" } : x)), [DAI[1], DAI[0], ...DAI.slice(2)], [...DAI, { name: "value", type: "uint256" }]])
+    assert.equal(detectApprovals("sign_typed_data", { typedData: td(f, { holder: SP, spender: BAD, nonce: 0, expiry: 0, allowed: false, value: "5" }) }).approvals.length, 1);
+});

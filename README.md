@@ -66,7 +66,7 @@ The plugin uses OpenClaw's `before_tool_call` hook.
 - **Every approval in a call is screened**, including nested and batched transactions (`calls`, `transactions`, multicall `bytes[]`). The Wallet Risk Card is fetched once per spender, but every approval is judged on its own (amount, unlimited, token, revoke status): a positive grant never inherits the softer treatment of a zero-amount operation next to it. The results are combined strictly: if any approval is blocked the whole call is blocked; otherwise, if any needs your OK, you are asked once with every reason.
 - Approval content that cannot be fully decoded (truncated calldata, tightly packed batches such as Safe `multiSend`, unparsed `cast` commands, very deep or very large batches), or whose explicit fields disagree with the call arguments or calldata, is never treated as screened: it follows `onCheckError` (ask by default).
 - **Chain**: chain ids are read the same way everywhere (names, decimal or hex ids, `eip155:N`). The configured `defaultChain` is used only when no chain is given. An unsupported chain id, or chain ids that disagree, follow `onCheckError`; screening never runs on a guessed network.
-- Only certain revokes are skipped: `setApprovalForAll(operator, false)` and approvals to the zero address. `approve(spender, 0)` with a non-zero spender is ambiguous (an ERC-20 revoke, or an ERC-721 approval of token #0), so the spender is still screened; for a risky or sanctioned spender you are asked instead of the call being blocked, since it may be a revoke. MoneyTools' own check URLs are never checked, so the plugin cannot loop.
+- Only certain revokes are skipped: `setApprovalForAll(operator, false)`, approvals to the zero address, and a DAI permit with `allowed: false` whose signed type is exactly DAI's `Permit(holder, spender, nonce, expiry, bool allowed)` (an `allowed` property that is not part of the signed type is ignored). `approve(spender, 0)` with a non-zero spender is ambiguous (an ERC-20 revoke, or an ERC-721 approval of token #0), so the spender is still screened; for a risky or sanctioned spender you are asked instead of the call being blocked, since it may be a revoke. MoneyTools' own check URLs are never checked, so the plugin cannot loop.
 
 Detection is heuristic. It covers the formats above; it is not a replacement for wallet-level transaction and signing controls.
 
@@ -94,6 +94,7 @@ Run `npm test`. The tests make no network calls and spend nothing. The x402 sign
 
 ## Changelog
 
+- **0.1.8**: a permit is treated as a DAI revoke only when its signed type declares `allowed` as a bool in DAI's Permit format; otherwise it is screened.
 - **0.1.7**: Permit2 witness transfers screened; EIP-712 domain and type definitions validated; unknown permit-like typed data follows `onCheckError`. MoneyTools responses validated and reduced to allowlisted fields before use.
 - **0.1.6**: AgentCash never pays automatically (key-wallet autoPay unchanged); an AgentCash-paid check needs a per-call user confirmation. Risk is looked up once per spender, but every approval is judged separately.
 - **0.1.5**: one chain-id normalizer (hex, decimal, CAIP-2); unsupported or conflicting chain ids follow `onCheckError`; raw EIP-2612, DAI and Permit2 `permit` calldata is decoded and screened.

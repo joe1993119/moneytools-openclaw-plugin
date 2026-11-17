@@ -272,3 +272,9 @@ test("upstream responses: unexpected fields and free text are dropped; malformed
   const ge = createGuard({}, { env: {}, fileExists: () => false, fetch: async () => new Response(JSON.stringify({ error: inj, message: inj }), { status: 500 }) });
   const o2 = await toolDefs(ge, T6)[1].execute("1", { address: SP }); assert.equal(o2.details.error, "http_500"); assert.ok(!o2.content[0].text.includes("IGNORE"));
 });
+
+test("EIP-2612 permit with an unsigned allowed:false to a high-risk spender is blocked", async () => {
+  const td = { types: { Permit: [{ name: "owner", type: "address" }, { name: "spender", type: "address" }, { name: "value", type: "uint256" }, { name: "nonce", type: "uint256" }, { name: "deadline", type: "uint256" }] }, primaryType: "Permit", domain: { chainId: 8453, verifyingContract: "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" }, message: { owner: SP, spender: BADSP, value: "1000000", nonce: 0, deadline: 1, allowed: false } };
+  const g = createGuard({}, { env: {}, fileExists: () => false, fetch: riskFetch({ [BADSP]: { level: "high", riskScore: 90, grade: "F" } }) });
+  assert.equal((await g.beforeToolCall({ toolName: "wallet_request", params: { method: "eth_signTypedData_v4", params: [SP, JSON.stringify(td)] } })).block, true);
+});

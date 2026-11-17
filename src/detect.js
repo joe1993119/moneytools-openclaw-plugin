@@ -179,6 +179,11 @@ function structuredApproval(v, chain, problems) {
   return op;
 }
 
+const DAI_PERMIT_FIELDS = [["holder", "address"], ["spender", "address"], ["nonce", "uint256"], ["expiry", "uint256"], ["allowed", "bool"]];
+function isDaiPermitType(pt, types) {
+  const f = /^permit$/i.test(pt) && isObj(types) ? types[pt] : null;
+  return Array.isArray(f) && f.length === DAI_PERMIT_FIELDS.length && f.every((x, i) => isObj(x) && x.name === DAI_PERMIT_FIELDS[i][0] && x.type === DAI_PERMIT_FIELDS[i][1]);
+}
 /** EIP-712 permits: EIP-2612 / DAI Permit and every Permit2 type (allowance, transfer, witness transfer; single and batch).
  *  The domain (verifying contract, chain) and type definitions are checked; unknown permit-like types are reported, never ignored. */
 function typedDataApprovals(v, chain, problems) {
@@ -201,7 +206,8 @@ function typedDataApprovals(v, chain, problems) {
   const spender = m.spender ?? m.details?.spender;
   if (!isAddr(spender)) { problems.push(`${pt} signature without a decodable spender`); return []; }
   if (BigInt(spender) === 0n) return [];
-  if (/^permit$/i.test(pt) && "allowed" in m && (m.allowed === false || m.allowed === "false" || m.allowed === 0)) return []; // DAI permit revoke
+  // DAI permit revoke only when the signed type is exactly DAI's Permit(holder, spender, nonce, expiry, bool allowed); an unsigned `allowed` property is ignored.
+  if (isDaiPermitType(pt, v.types) && (m.allowed === false || m.allowed === "false" || m.allowed === 0 || m.allowed === "0")) return [];
   const permitted = m.permitted ?? m.details; const first = Array.isArray(permitted) ? permitted[0] : permitted;
   const token = isP2 ? (isAddr(first?.token) ? first.token : null) : d.verifyingContract;
   const amount = Array.isArray(permitted) ? undefined : (first?.amount ?? m.value);
