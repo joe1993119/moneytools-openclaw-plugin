@@ -29,7 +29,9 @@ The plugin is off until you enable it, and it spends nothing until you set `auto
 
 - **Payer** (`payer: "auto"`): the EVM key in `X402_PRIVATE_KEY` if set (the same variable AgentCash and x402 clients use), otherwise an existing AgentCash wallet (`~/.agentcash/wallet.json`, paid through the pinned `agentcash@0.17.1` CLI). The plugin never reads the AgentCash wallet file; it only checks that it exists. If neither is present, only the free tier is used.
 - **Price guard**: before paying, the plugin reads the 402 quote and pays only if it is USDC on Base, payTo is the MoneyTools wallet `0x64eB63904Cf9688AC5B3087A72AcF9C31a273169`, and the amount is at most the published price (0.005 or 0.02 USDC).
-- **Daily cap**: `dailyBudgetUsd` (default 0.25 USDC per UTC day, max 5).
+- **Signed-payment check**: with a key payer, the plugin signs only the single verified requirement, then checks the signed authorization (amount, USDC, Base, payTo, validity window) against the quote before sending it. One paid request, no automatic retry. With the AgentCash payer, AgentCash is limited to x402 on Base and to the quoted price (`--max-amount`).
+- **Daily cap**: `dailyBudgetUsd` (default 0.25 USDC per UTC day, max 5). Spend is reserved before each payment starts, so parallel checks cannot exceed the cap; a payment that does not complete gives its reservation back. Identical checks running at the same time share one payment.
+- **What is sent**: only the scheme, host, port and path of the URL being checked. User info, query strings and fragments (API keys, signed links) are dropped before the precheck request and are not logged.
 - **Cache**: the same URL or spender is not checked again for `cacheMinutes` (default 10).
 - `autoPay` (default `false`): with `false` the plugin never pays; precheck uses its free daily tier, and a check that needs payment (always the Wallet Risk Card) goes to `onCheckError`, which asks you by default.
 
@@ -81,6 +83,11 @@ npx agentcash fetch "https://api.moneytools.dev/v1/precheck?url=https://example.
 ## Tests
 
 Run `npm test`. The tests make no network calls and spend nothing. The x402 signing test uses a random throwaway key against a local server.
+
+## Changelog
+
+- **0.1.2**: signed payments are checked against the verified quote before sending; atomic daily-budget reservation; user info, query and fragment stripped from checked URLs.
+- **0.1.1**: paid checks opt-in (`autoPay` default false), 0.25 USDC/day cap.
 
 ## Support
 

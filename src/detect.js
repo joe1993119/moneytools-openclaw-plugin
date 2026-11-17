@@ -24,7 +24,9 @@ export const CHAINS = { base: "base", "8453": "base", "eip155:8453": "base", eth
 
 const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
 function* walk(v, depth = 0, key = "") { if (depth > 6) return; yield [key, v]; if (Array.isArray(v)) { for (const x of v.slice(0, 50)) yield* walk(x, depth + 1, key); } else if (isObj(v)) { for (const [k, x] of Object.entries(v).slice(0, 100)) yield* walk(x, depth + 1, k); } }
-const httpUrl = (s) => { if (typeof s !== "string") return null; try { const u = new URL(s.trim()); return /^https?:$/.test(u.protocol) ? u.toString() : null; } catch { return null; } };
+// Returned URLs carry only scheme, host, port and path: user info, query string and fragment are dropped so they never reach logs or the check API.
+export const stripUrl = (s) => { if (typeof s !== "string") return null; try { const u = new URL(s.trim()); if (!/^https?:$/.test(u.protocol)) return null; u.username = ""; u.password = ""; u.search = ""; u.hash = ""; return u.toString(); } catch { return null; } };
+const httpUrl = stripUrl;
 
 export function isOwnCheckUrl(url) { try { return /(^|\.)moneytools\.dev$/i.test(new URL(url).hostname); } catch { return false; } }
 
@@ -50,8 +52,8 @@ export function detectX402Payment(toolName, params, opts = {}) {
   if (EXEC_TOOLS.test(name) || opts.toolKind === "code_mode_exec") {
     const cmd = commandOf(params);
     const m = /\bagentcash(?:@[\w.\-]+)?\s+(?:fetch|fetch-auth)\s+["']?(https?:\/\/[^\s"']+)/i.exec(cmd);
-    if (m && !isOwnCheckUrl(m[1])) return { url: m[1], method: /(?:-m|--method)\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:agentcash" };
-    if (/(payment-signature|x-payment)\s*:/i.test(cmd)) { const u = /(https?:\/\/[^\s"']+)/.exec(cmd)?.[1]; if (u && !isOwnCheckUrl(u)) return { url: u, method: /-X\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:payment-header" }; }
+    if (m && !isOwnCheckUrl(m[1]) && stripUrl(m[1])) return { url: stripUrl(m[1]), method: /(?:-m|--method)\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:agentcash" };
+    if (/(payment-signature|x-payment)\s*:/i.test(cmd)) { const u = /(https?:\/\/[^\s"']+)/.exec(cmd)?.[1]; if (u && !isOwnCheckUrl(u) && stripUrl(u)) return { url: stripUrl(u), method: /-X\s+(POST|PUT|PATCH|DELETE)/i.exec(cmd)?.[1]?.toUpperCase() || "GET", via: "exec:payment-header" }; }
     return null;
   }
   const url = findUrl(params); if (!url || isOwnCheckUrl(url)) return null;

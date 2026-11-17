@@ -1,6 +1,7 @@
 import test from "node:test"; import assert from "node:assert/strict";
 import { createGuard, registerGuard, decideRisk, decidePrecheck, readConfig } from "../src/guard.js";
-import { verifyQuote, resolvePayer, MONEYTOOLS_PAY_TO } from "../src/checks.js";
+import { verifyQuote, verifySignedPayment, resolvePayer, makeBudget, callCheck, precheckUrl, sanitizeTargetUrl, runAgentcash, MONEYTOOLS_PAY_TO } from "../src/checks.js";
+import { detectX402Payment } from "../src/detect.js";
 
 const SP = "0x1111111254eeb25477b68fb85ed929f73a960582";
 const approveTx = { data: "0x095ea7b3" + SP.slice(2).padStart(64, "0") + "f".repeat(64), chainId: 8453 };
@@ -8,8 +9,12 @@ const quote = (amount, payTo = MONEYTOOLS_PAY_TO, network = "eip155:8453") => ({
 const res402 = (q) => new Response(JSON.stringify(q), { status: 402, headers: { "content-type": "application/json", "payment-required": Buffer.from(JSON.stringify(q)).toString("base64") } });
 const res200 = (o) => new Response(JSON.stringify(o), { status: 200, headers: { "content-type": "application/json" } });
 const KEYENV = { X402_PRIVATE_KEY: "0x" + "11".repeat(32) };
-function fakeX402(paidBody, status = 200) { const calls = []; return { calls, mods: { accounts: { privateKeyToAccount: (k) => ({ address: "0xabc", k }) }, evm: { registerExactEvmScheme: () => {} },
-  fetch: { x402Client: class {}, wrapFetchWithPayment: () => async (url) => { calls.push(url); return new Response(JSON.stringify(paidBody), { status }); } } } }; }
+// Fake x402 client: "signs" exactly the requirement it is given (tamper() may alter the signed payload); the paid request goes through the test fetch.
+function fakeX402(paidBody, status = 200, tamper = (p) => p) { const calls = []; const signed = []; return { calls, signed, mods: { accounts: { privateKeyToAccount: (k) => ({ address: "0xabc", k }) }, evm: { registerExactEvmScheme: () => {} },
+  fetch: { x402Client: class {}, x402HTTPClient: class {
+    async createPaymentPayload(pr) { const a = pr.accepts[0]; const p = tamper({ x402Version: 2, accepted: { ...a }, payload: { signature: "0xsig", authorization: { from: "0xabc", to: a.payTo, value: a.amount, validAfter: "0", validBefore: String(Math.floor(Date.now() / 1000) + 300), nonce: "0x01" } } }); signed.push({ pr, p }); return p; }
+    encodePaymentSignatureHeader(p) { return { "PAYMENT-SIGNATURE": Buffer.from(JSON.stringify(p)).toString("base64") }; } } } },
+  paidFetch: (q) => async (url, init = {}) => { if (init.headers?.["PAYMENT-SIGNATURE"]) { calls.push(url); return new Response(JSON.stringify(paidBody), { status }); } return res402(q); } }; }
 
 test("quote check: only USDC on Base to the MoneyTools wallet at or below the published price is paid", () => {
   assert.equal(verifyQuote(res402(quote(20000)), null, 0.02).amountUsd, 0.02);
@@ -25,7 +30,7 @@ test("payer: key from env, else existing AgentCash wallet (existence only), else
 });
 test("approve to a high-risk spender is blocked after a paid 0.02 Wallet Risk Card", async () => {
   const x = fakeX402({ level: "high", riskScore: 85, grade: "E", sanctioned: false, headline: "Risk high" });
-  const g = createGuard({ autoPay: true }, { env: KEYENV, fileExists: () => false, fetch: async () => res402(quote(20000)), x402: x.mods });
+  const g = createGuard({ autoPay: true }, { env: KEYENV, fileExists: () => false, fetch: x.paidFetch(quote(20000)), x402: x.mods });
   const d = await g.beforeToolCall({ toolName: "send_transaction", params: approveTx });
   assert.equal(d.block, true); assert.match(d.blockReason, /high risk/); assert.match(x.calls[0], /tools\.moneytools\.dev\/v1\/wallet-risk\?address=0x1111.*&chain=base/);
   assert.equal(g.budget.spentUsd, 0.02);
@@ -45,7 +50,7 @@ test("x402 payment: precheck free tier (200) costs nothing; block verdict blocks
   assert.equal(decidePrecheck(readConfig({}), "u", { verdict: "warn", warnings: ["w"] }).requireApproval.title, "Pay precheck warning");
 });
 test("after the free tier the precheck is paid via AgentCash at 0.005", async () => {
-  let ac = 0; const g = createGuard({ autoPay: true }, { env: {}, fileExists: () => true, fetch: async () => res402(quote(5000)), agentcash: async (u) => { ac++; assert.match(u, /api\.moneytools\.dev\/v1\/precheck\?url=https%3A%2F%2Fs\.example/); return { verdict: "ok" }; } });
+  let ac = 0; const g = createGuard({ autoPay: true }, { env: {}, fileExists: () => true, fetch: async () => res402(quote(5000)), agentcash: async (u, o) => { ac++; assert.equal(o.maxUsd, 0.005); assert.match(u, /api\.moneytools\.dev\/v1\/precheck\?url=https%3A%2F%2Fs\.example/); return { verdict: "ok" }; } });
   assert.equal(await g.beforeToolCall({ toolName: "x402_fetch", params: { url: "https://s.example/p" } }), undefined);
   assert.equal(ac, 1); assert.equal(g.budget.spentUsd, 0.005);
 });
@@ -53,19 +58,19 @@ test("no wallet / budget reached / overpriced quote: nothing is paid and the use
   const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async () => res402(quote(20000)) });
   const d = await g.beforeToolCall({ toolName: "send_transaction", params: approveTx });
   assert.match(d.requireApproval.description, /Nothing was charged/);
-  const x = fakeX402({ level: "low" }); const g2 = createGuard({ autoPay: true, dailyBudgetUsd: 0.01 }, { env: KEYENV, fileExists: () => false, fetch: async () => res402(quote(20000)), x402: x.mods });
+  const x = fakeX402({ level: "low" }); const g2 = createGuard({ autoPay: true, dailyBudgetUsd: 0.01 }, { env: KEYENV, fileExists: () => false, fetch: x.paidFetch(quote(20000)), x402: x.mods });
   assert.match((await g2.beforeToolCall({ toolName: "send_transaction", params: approveTx })).requireApproval.description, /budget/); assert.equal(x.calls.length, 0);
-  const g3 = createGuard({ autoPay: true, onCheckError: "block" }, { env: KEYENV, fileExists: () => false, fetch: async () => res402(quote(99000)), x402: x.mods });
+  const g3 = createGuard({ autoPay: true, onCheckError: "block" }, { env: KEYENV, fileExists: () => false, fetch: x.paidFetch(quote(99000)), x402: x.mods });
   assert.equal((await g3.beforeToolCall({ toolName: "send_transaction", params: approveTx })).block, true); assert.equal(x.calls.length, 0);
 });
 test("a failed paid check (non-200) is reported as not charged and not counted", async () => {
   const x = fakeX402({ error: "upstream_error", message: "rpc down" }, 502);
-  const g = createGuard({ autoPay: true, onCheckError: "allow" }, { env: KEYENV, fileExists: () => false, fetch: async () => res402(quote(20000)), x402: x.mods });
+  const g = createGuard({ autoPay: true, onCheckError: "allow" }, { env: KEYENV, fileExists: () => false, fetch: x.paidFetch(quote(20000)), x402: x.mods });
   assert.equal(await g.beforeToolCall({ toolName: "send_transaction", params: approveTx }), undefined); assert.equal(g.budget.spentUsd, 0);
 });
 test("default is opt-in: autoPay is false, cap 0.25; without autoPay nothing is ever paid", async () => {
   assert.equal(readConfig({}).autoPay, false); assert.equal(readConfig({}).dailyBudgetUsd, 0.25);
-  const x = fakeX402({ level: "low" }); const g = createGuard({}, { env: KEYENV, fileExists: () => true, fetch: async () => res402(quote(20000)), x402: x.mods });
+  const x = fakeX402({ level: "low" }); const g = createGuard({}, { env: KEYENV, fileExists: () => true, fetch: x.paidFetch(quote(20000)), x402: x.mods });
   assert.ok((await g.beforeToolCall({ toolName: "send_transaction", params: approveTx })).requireApproval); assert.equal(x.calls.length, 0);
 });
 test("registerGuard wires before_tool_call and two tools on an OpenClaw-like api", async () => {
@@ -74,3 +79,68 @@ test("registerGuard wires before_tool_call and two tools on an OpenClaw-like api
   assert.equal(hooks[0][0], "before_tool_call"); assert.deepEqual(tools.map((t) => t.name), ["moneytools_pay_precheck", "moneytools_wallet_risk"]);
   const out = await tools[0].execute("1", { url: "https://s.example/" }); assert.equal(out.details.verdict, "ok"); assert.equal(out.details.paidUsd, 0);
 });
+
+// --- 0.1.2: ClawHub scan findings ---
+test("finding 1: the signed payment must match the verified quote (amount <= maxUsd, USDC, Base, MoneyTools payTo) or it is not sent", async () => {
+  const q = verifyQuote(res402(quote(20000)), null, 0.02);
+  const good = { x402Version: 2, accepted: { ...q.accept }, payload: { authorization: { to: MONEYTOOLS_PAY_TO, value: "20000", validBefore: String(Math.floor(Date.now() / 1000) + 300) } } };
+  assert.equal(verifySignedPayment(good, q, 0.02), true);
+  const bad = (f) => { const p = structuredClone(good); f(p); return p; };
+  assert.throws(() => verifySignedPayment(bad((p) => { p.payload.authorization.value = "30000"; }), q, 0.02), /amount/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.accepted.amount = "30000"; }), q, 0.02), /amount/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.payload.authorization.to = "0x000000000000000000000000000000000000dEaD"; }), q, 0.02), /payTo/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.accepted.payTo = "0x000000000000000000000000000000000000dEaD"; }), q, 0.02), /payTo/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.accepted.asset = "0x0000000000000000000000000000000000000001"; }), q, 0.02), /asset/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.accepted.network = "eip155:1"; }), q, 0.02), /network/);
+  assert.throws(() => verifySignedPayment(bad((p) => { p.payload.authorization.validBefore = String(Math.floor(Date.now() / 1000) + 86400 * 365); }), q, 0.02), /window/);
+  assert.throws(() => verifySignedPayment(good, q, 0.005), /cap/);
+  // end to end: a client that signs different terms than quoted never gets its payment sent, and nothing is counted
+  const x = fakeX402({ level: "low" }, 200, (p) => { p.payload.authorization.to = "0x000000000000000000000000000000000000dEaD"; return p; });
+  const budget = makeBudget(0.25);
+  await assert.rejects(callCheck("https://tools.moneytools.dev/v1/wallet-risk?address=0x1&chain=base", { maxUsd: 0.02, payer: { kind: "key", keyEnv: "X402_PRIVATE_KEY" }, env: KEYENV, fetch: x.paidFetch(quote(20000)), x402: x.mods, budget }), /bad_payment|does not match/);
+  assert.equal(x.calls.length, 0); assert.equal(budget.spentUsd, 0);
+  // the client is only ever offered the single verified requirement
+  const x2 = fakeX402({ level: "low" }); const q2 = quote(20000); q2.accepts.push({ ...q2.accepts[0], network: "eip155:1", amount: "999999" });
+  await callCheck("https://tools.moneytools.dev/v1/wallet-risk?address=0x1&chain=base", { maxUsd: 0.02, payer: { kind: "key", keyEnv: "X402_PRIVATE_KEY" }, env: KEYENV, fetch: x2.paidFetch(q2), x402: x2.mods });
+  assert.equal(x2.signed[0].pr.accepts.length, 1); assert.equal(x2.signed[0].pr.accepts[0].network, "eip155:8453");
+  // a second 402 after paying is a failed, uncounted check (no automatic retry)
+  const x3 = fakeX402({ error: "payment_required" }, 402); const b3 = makeBudget(0.25);
+  await assert.rejects(callCheck("https://tools.moneytools.dev/v1/wallet-risk?address=0x1&chain=base", { maxUsd: 0.02, payer: { kind: "key", keyEnv: "X402_PRIVATE_KEY" }, env: KEYENV, fetch: x3.paidFetch(quote(20000)), x402: x3.mods, budget: b3 }));
+  assert.equal(x3.calls.length, 1); assert.equal(b3.spentUsd, 0);
+});
+test("finding 1 (AgentCash payer): AgentCash is limited to x402 on Base and the quoted price per request", async () => {
+  let args; const fakeSpawn = (_c, a) => { args = a; const ev = {}; const p = { stdout: { on: (_e, f) => { ev.data = f; } }, on: (e, f) => { ev[e] = f; }, kill() {} }; setImmediate(() => { ev.data(JSON.stringify({ success: true, data: { verdict: "ok" } })); ev.close(); }); return p; };
+  assert.deepEqual(await runAgentcash("https://api.moneytools.dev/v1/precheck?url=x", { spawnFn: fakeSpawn, maxUsd: 0.005 }), { verdict: "ok" });
+  assert.deepEqual(args.slice(-6), ["--payment-protocol", "x402", "--payment-network", "base", "--max-amount", "0.005"]);
+  await assert.rejects(runAgentcash("https://api.moneytools.dev/v1/precheck?url=x", { spawnFn: fakeSpawn }), /cap/);
+});
+test("finding 2: budget reservation is atomic; parallel paid checks cannot exceed the daily cap; failures give the reservation back", async () => {
+  const b = makeBudget(0.05); const r1 = b.reserve(0.02), r2 = b.reserve(0.02), r3 = b.reserve(0.02);
+  assert.ok(r1 && r2); assert.equal(r3, null); assert.equal(b.spentUsd, 0.04);
+  r2.release(); r2.release(); assert.equal(b.spentUsd, 0.02); r1.commit(); r1.release(); assert.equal(b.spentUsd, 0.02);
+  // 10 concurrent checks for different spenders against a 0.05 cap at 0.02 each: at most 2 are paid
+  const x = fakeX402({ level: "low" }); let pending = [];
+  const slowFetch = (q) => async (url, init = {}) => { await new Promise((r) => setTimeout(r, 5)); return x.paidFetch(q)(url, init); };
+  const g = createGuard({ autoPay: true, dailyBudgetUsd: 0.05, onCheckError: "block" }, { env: KEYENV, fileExists: () => false, fetch: slowFetch(quote(20000)), x402: x.mods });
+  for (let i = 0; i < 10; i++) { const sp = "0x" + String(i + 1).padStart(40, "0"); pending.push(g.walletRisk(sp, "base").then(() => "paid", () => "refused")); }
+  const out = await Promise.all(pending);
+  assert.equal(out.filter((o) => o === "paid").length, 2); assert.equal(x.calls.length, 2); assert.ok(g.budget.spentUsd <= 0.05 + 1e-9);
+  // identical checks running at the same time share one payment
+  const x2 = fakeX402({ level: "low" }); const g2 = createGuard({ autoPay: true }, { env: KEYENV, fileExists: () => false, fetch: x2.paidFetch(quote(20000)), x402: x2.mods });
+  await Promise.all([g2.walletRisk(SP, "base"), g2.walletRisk(SP, "base"), g2.walletRisk(SP, "base")]);
+  assert.equal(x2.calls.length, 1); assert.equal(g2.budget.spentUsd, 0.02);
+});
+test("finding 3: user info, query string and fragment never leave the agent", async () => {
+  assert.equal(sanitizeTargetUrl("https://user:pass@seller.example:8443/v1/data?api_key=SECRET&sig=abc#frag"), "https://seller.example:8443/v1/data");
+  assert.throws(() => sanitizeTargetUrl("file:///etc/passwd"), /http/);
+  const u = precheckUrl("https://u:p@s.example/p?token=SECRET#x", "GET");
+  assert.ok(!/SECRET|token|u%3Ap|%23x/.test(u)); assert.match(u, /url=https%3A%2F%2Fs\.example%2Fp&method=GET$/);
+  assert.equal(detectX402Payment("x402_fetch", { url: "https://u:p@s.example/p?key=SECRET#f" }).url, "https://s.example/p");
+  assert.equal(detectX402Payment("exec", { command: "npx agentcash fetch 'https://s.example/p?key=SECRET'" }).url, "https://s.example/p");
+  const seen = []; const g = createGuard({}, { env: {}, fileExists: () => false, fetch: async (url) => { seen.push(url); return res200({ verdict: "ok" }); } });
+  await g.beforeToolCall({ toolName: "agentcash__fetch", params: { url: "https://u:p@s.example/p?key=SECRET#f" } });
+  const t = toolDefsFor(g); await t.execute("1", { url: "https://s.example/q?access_token=SECRET2" });
+  assert.equal(seen.length, 2); for (const s of seen) assert.ok(!/SECRET|key%3D|access_token|u%3Ap/.test(s), s);
+});
+import { toolDefs } from "../src/guard.js";
+const toolDefsFor = (g) => toolDefs(g, { Object: (p) => p, String: (o) => o, Optional: (s) => s })[0];

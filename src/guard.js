@@ -1,6 +1,6 @@
 // Host-free plugin logic: config, decisions, the before_tool_call handler and the two explicit tools.
 import { detectX402Payment, detectApproval, DEFAULT_PAYMENT_TOOL_PATTERN, CHAINS } from "./detect.js";
-import { callCheck, resolvePayer, makeBudget, precheckUrl, walletRiskUrl, PRICES, CheckError } from "./checks.js";
+import { callCheck, resolvePayer, makeBudget, precheckUrl, walletRiskUrl, sanitizeTargetUrl, PRICES, CheckError } from "./checks.js";
 
 export const PLUGIN_ID = "moneytools-guard";
 export const DEFAULTS = { autoPay: false, payer: "auto", privateKeyEnv: "X402_PRIVATE_KEY", dailyBudgetUsd: 0.25, precheckPayments: true, checkApprovals: true,
@@ -45,9 +45,16 @@ export function createGuard(rawCfg, deps = {}) {
   const cfg = readConfig(rawCfg); const env = deps.env || process.env; const log = deps.logger || { info() {}, warn() {} };
   const budget = makeBudget(cfg.dailyBudgetUsd, deps.now); const cache = new Map(); const ttl = cfg.cacheMinutes * 60000; const now = deps.now || (() => Date.now());
   const payer = () => (cfg.autoPay ? resolvePayer(cfg, env, deps.fileExists) : { kind: "none", reason: "autoPay is off (free tier only)" });
-  async function cached(key, fn) { const hit = cache.get(key); if (hit && now() - hit.at < ttl) return hit.v; const v = await fn(); cache.set(key, { v, at: now() }); if (cache.size > 500) cache.delete(cache.keys().next().value); return v; }
-  const run = (url, maxUsd) => callCheck(url, { maxUsd, payer: payer(), env, fetch: deps.fetch || globalThis.fetch, x402: deps.x402, agentcash: deps.agentcash, budget });
-  const precheck = (target, method) => cached(`p:${method}:${target}`, () => run(precheckUrl(target, method), PRICES.precheck));
+  const inflight = new Map();
+  // Results are cached, and identical checks already running share one request (and at most one payment).
+  async function cached(key, fn) {
+    const hit = cache.get(key); if (hit && now() - hit.at < ttl) return hit.v;
+    if (inflight.has(key)) return inflight.get(key);
+    const p = (async () => { try { const v = await fn(); cache.set(key, { v, at: now() }); if (cache.size > 500) cache.delete(cache.keys().next().value); return v; } finally { inflight.delete(key); } })();
+    inflight.set(key, p); return p;
+  }
+  const run = (url, maxUsd) => callCheck(url, { maxUsd, payer: payer(), env, fetch: deps.fetch || globalThis.fetch, x402: deps.x402, agentcash: deps.agentcash, budget, now: deps.now });
+  const precheck = async (target, method) => { const t = sanitizeTargetUrl(target); return cached(`p:${method}:${t}`, () => run(precheckUrl(t, method), PRICES.precheck)); };
   const walletRisk = (address, chain) => cached(`w:${chain}:${address.toLowerCase()}`, () => run(walletRiskUrl(address, chain), PRICES.walletRisk));
 
   async function beforeToolCall(event, ctx = {}) {
@@ -56,7 +63,7 @@ export function createGuard(rawCfg, deps = {}) {
       if (a) { try { const { data, paidUsd } = await walletRisk(a.spender, a.chain); log.info?.(`[${PLUGIN_ID}] wallet-risk ${a.spender} ${a.chain}: ${data?.level} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decideRisk(cfg, a, data); }
         catch (e) { return onError(cfg, "Wallet Risk Card", e); } } }
     if (cfg.precheckPayments) { const p = detectX402Payment(name, params, opts);
-      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${p.url}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decidePrecheck(cfg, p.url, data); }
+      if (p) { try { const { data, paidUsd } = await precheck(p.url, p.method); log.info?.(`[${PLUGIN_ID}] precheck ${sanitizeTargetUrl(p.url)}: ${data?.verdict} (${paidUsd ? fmtUsd(paidUsd) : "free/cached"})`); return decidePrecheck(cfg, p.url, data); }
         catch (e) { return onError(cfg, "pay precheck", e); } } }
     return undefined;
   }
