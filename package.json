@@ -1,0 +1,30 @@
+{
+  "name": "@moneytools-dev/openclaw-plugin",
+  "version": "0.1.1",
+  "description": "OpenClaw plugin: MoneyTools pay precheck before every x402 payment and a Wallet Risk Card before every token approval. Pays from the agent's own wallet; failed checks are not charged.",
+  "type": "module",
+  "main": "./index.js",
+  "exports": { ".": "./index.js", "./guard": "./src/guard.js", "./detect": "./src/detect.js" },
+  "files": ["index.js", "src/", "openclaw.plugin.json", "assets/", "README.md", "LICENSE"],
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "dependencies": {
+    "typebox": "1.4.2",
+    "@x402/fetch": "^2.31.0",
+    "@x402/evm": "^2.31.0",
+    "viem": "^2.40.0"
+  },
+  "peerDependencies": { "openclaw": ">=2026.11.5" },
+  "peerDependenciesMeta": { "openclaw": { "optional": true } },
+  "openclaw": {
+    "extensions": ["./index.js"],
+    "compat": { "pluginApi": ">=2026.11.5", "minGatewayVersion": "2026.11.5" },
+    "build": { "openclawVersion": "2026.11.5", "pluginSdkVersion": "2026.11.5" }
+  },
+  "engines": { "node": ">=24.22.1" },
+  "keywords": ["openclaw", "openclaw-plugin", "x402", "usdc", "base", "payment-safety", "wallet-risk", "approvals", "agent"],
+  "license": "MIT",
+  "author": "MoneyTools Team <support@moneytools.dev>",
+  "homepage": "https://moneytools.dev/products/payment-safety/",
+  "bugs": { "email": "support@moneytools.dev" },
+  "publishConfig": { "access": "public" }
+}
